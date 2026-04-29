@@ -45,6 +45,7 @@ import {
   buildReplyBody,
   type ActivityEntry,
 } from './lib/notification.ts'
+import { Dedup } from './lib/dedup.ts'
 
 // ─── Config ─────────────────────────────────────────────────────────────
 
@@ -142,7 +143,10 @@ process.on('uncaughtException', err => {
 
 // ActivityEntry type moved to lib/notification.ts so it's importable by tests.
 
-const seenIds = new Map<string, Set<string>>()  // workspace_id → Set<activity.id>
+// Per-workspace dedup state. Eviction is by age (POLL_WINDOW_SECS × 2)
+// not by count — see lib/dedup.ts for why count-based trimming had a
+// re-emit race on busy workspaces.
+const dedupByWorkspace = new Map<string, Dedup>()
 
 async function pollWorkspace(workspaceId: string, mcp: Server): Promise<void> {
   const token = TOKEN_BY_WORKSPACE.get(workspaceId)!
@@ -180,25 +184,29 @@ async function pollWorkspace(workspaceId: string, mcp: Server): Promise<void> {
     return
   }
 
-  const seen = seenIds.get(workspaceId) ?? new Set<string>()
+  // Lazy-init the per-workspace dedup with eviction window 2× POLL_WINDOW_SECS.
+  // The 2× margin is because the platform's /activity may continue to return
+  // an event for the full POLL_WINDOW_SECS window after first sighting; the
+  // dedup must outlast that window plus margin for clock drift / network
+  // jitter. See lib/dedup.ts for the v0.1 race this prevents.
+  let dedup = dedupByWorkspace.get(workspaceId)
+  if (!dedup) {
+    dedup = new Dedup({ evictAfterMs: POLL_WINDOW_SECS * 1000 * 2 })
+    dedupByWorkspace.set(workspaceId, dedup)
+  }
+
   // Activities arrive newest-first per /activity contract. Reverse so we
   // emit in chronological order — peers see "earliest unseen first" instead
   // of out-of-order if multiple landed in one window.
   for (const act of activities.slice().reverse()) {
-    if (seen.has(act.id)) continue
-    seen.add(act.id)
+    if (!dedup.observe(act.id)) continue  // duplicate
     emitNotification(mcp, workspaceId, act)
   }
-  // Cap dedup set so it can't grow unbounded across multi-day sessions.
-  // Activity ids that age past POLL_WINDOW_SECS won't reappear in a future
-  // /activity response anyway (since_secs filters them out), so trimming
-  // is safe.
-  if (seen.size > 1000) {
-    const ids = Array.from(seen).slice(-500)
-    seen.clear()
-    for (const id of ids) seen.add(id)
-  }
-  seenIds.set(workspaceId, seen)
+
+  // Evict expired ids so the dedup set stays bounded across long sessions.
+  // No-op when nothing's expired; on quiet workspaces the size grows
+  // organically with traffic and shrinks when polls go quiet.
+  dedup.evictExpired()
 }
 
 // ─── Notification emission ─────────────────────────────────────────────
