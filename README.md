@@ -2,6 +2,8 @@
 
 Claude Code channel plugin for [Molecule AI](https://moleculesai.app). Bridges Molecule A2A traffic into a Claude Code session: peer messages from your watched workspaces surface as conversation turns, and your replies route back through Molecule's A2A.
 
+> **⚠ v0.1 known limitation (issue #2):** Reply path requires manual peer_id input. The platform currently doesn't surface the sender's workspace_id into the activity log row that the plugin reads ([Molecule-AI/molecule-core#2306](https://github.com/Molecule-AI/molecule-core/issues/2306)), so notifications arrive with `meta.peer_id: ""`. Until the upstream fix lands, replying via `reply_to_workspace` requires Claude (or you) to know the peer's workspace_id from out-of-band context (e.g. canvas chat). Receiving works fully; replies require a manual workspace_id.
+
 ## What it does
 
 When you launch Claude Code with this plugin enabled and configure it to watch one or more Molecule workspaces, every A2A message your watched workspaces receive shows up in the session as a user-turn. You reply normally; the plugin's MCP `reply_to_workspace` tool sends the response back through Molecule.
@@ -13,6 +15,38 @@ Molecule peer ──A2A──> [your workspace] ──poll──> [this plugin] 
 ```
 
 No tunnel. No public endpoint. The plugin polls your tenant for new A2A activity (using the `?since_secs=` filter on `/workspaces/:id/activity`); replies POST back to `/workspaces/:peer_id/a2a` via the same bearer token.
+
+## Step 0 — register an inbound URL for the workspace
+
+**Required.** The plugin polls `/workspaces/:id/activity` for `a2a_receive` events; these events are only created when the platform forwards A2A to the workspace's registered URL. If your workspace has no URL registered, the platform never forwards anything to it, and the plugin sees no events.
+
+This means: **Step 0 is to register a URL** — even if the URL just points at a stub HTTP server that 200s every request. Two paths:
+
+**Option A — local stub (simplest for dev):**
+```bash
+# Run a stub HTTP server on port 9000 that 200s any POST
+python3 -c "
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        l = int(self.headers.get('content-length', 0)); self.rfile.read(l)
+        self.send_response(200); self.send_header('Content-Type','application/json'); self.end_headers()
+        self.wfile.write(json.dumps({'jsonrpc':'2.0','id':1,'result':{'parts':[{'type':'text','text':'ok'}]}}).encode())
+    def log_message(self,*a): pass
+HTTPServer(('127.0.0.1',9000),H).serve_forever()
+" &
+
+# Register the workspace's URL (use 'localhost' — SSRF check rejects 127.0.0.1 literal)
+curl -X POST "$MOLECULE_PLATFORM_URL/registry/register" \
+  -H "Authorization: Bearer $WORKSPACE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"id\":\"$WORKSPACE_ID\",\"url\":\"http://localhost:9000/agent\",\"agent_card\":{\"name\":\"My Claude Code\",\"version\":\"0.1.0\"}}"
+```
+
+**Option B — real A2A handler (production):** Use the [Python SDK A2AServer](https://github.com/Molecule-AI/molecule-sdk-python) or any HTTP server that handles A2A JSON-RPC.
+
+Either way, the URL is required because that's how the platform attributes inbound A2A. The plugin handles **surfacing** those events into Claude Code; it does not handle **receiving** A2A in the first place.
 
 ## Install
 
@@ -50,6 +84,17 @@ molecule channel: connected — watching 2 workspace(s) at https://your-tenant.s
   workspaces: ws-uuid-1, ws-uuid-2
   poll: every 5000ms with 30s window
 ```
+
+## Token rotation
+
+Workspace tokens authenticate both polling (`/activity` reads) and replies (`/a2a` posts). Treat them as long-lived secrets:
+
+- **When to rotate:** suspect compromise, leaked `.env`, leaving an org, or after a token has been on a shared/cloud-synced machine
+- **How to rotate:**
+  1. Canvas → workspace Settings → "Auth tokens" → click revoke on the affected token, then create a new one
+  2. Update `MOLECULE_WORKSPACE_TOKENS` in your local `.env` with the new value
+  3. Re-launch Claude Code (the plugin re-loads `.env` on startup)
+- **Multi-host:** `.env` is host-local; if you run Claude Code on multiple machines watching the same workspace, each host needs its own copy. Don't sync `.env` via Dropbox/iCloud/etc — colocated tokens defeat the rotation isolation.
 
 ## Getting workspace_id + token
 

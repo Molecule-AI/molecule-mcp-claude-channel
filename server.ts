@@ -25,9 +25,9 @@
  * each id polls independently. Auth is per-workspace via
  * MOLECULE_WORKSPACE_TOKENS (same order, comma-separated).
  *
- * Cancellation: SIGTERM/SIGINT cleanly drains in-flight pollers + posts a
- * single "channel disconnecting" line back to each watched workspace so
- * peers see a deliberate close, not a silent timeout.
+ * Cancellation: SIGTERM/SIGINT exits the process. In-flight HTTP requests
+ * are NOT awaited and peers receive no "disconnecting" notice — drain
+ * semantics are deferred to v0.2 (tracked in repo issue #4).
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -241,6 +241,16 @@ function extractText(act: ActivityEntry): string {
   ]
   for (const parts of candidates) {
     if (Array.isArray(parts)) {
+      // Log non-text parts skipped — image/file delivery deferred to v0.2
+      // (#7). Without this log, image-only messages silently fall through
+      // to the summary fallback and Claude has no idea content was dropped.
+      const nonText = parts.filter(p => p.type && p.type !== 'text').length
+      if (nonText > 0) {
+        process.stderr.write(
+          `molecule channel: ${nonText} non-text part(s) in ${act.id} skipped ` +
+          `(image/file delivery is v0.2)\n`,
+        )
+      }
       const text = parts.filter(p => p.type === 'text').map(p => p.text ?? '').join('')
       if (text) return text
     }
@@ -406,17 +416,29 @@ process.stderr.write(
   `  poll: every ${POLL_INTERVAL_MS}ms with ${POLL_WINDOW_SECS}s window\n`
 )
 
-// Stagger initial polls slightly so N-workspace watchers don't all hit the
-// platform at the same instant on every tick.
+// Stagger initial polls slightly + add per-tick jitter so N-workspace
+// watchers don't thundering-herd the platform on every interval boundary.
+// Without jitter (#8) all N pollers fire at the same instant every
+// POLL_INTERVAL_MS — at N=10+ that's a noticeable burst against the
+// platform every 5s. Jitter spreads the load uniformly.
+const JITTER_MS = Math.min(1000, POLL_INTERVAL_MS / 4)
 WORKSPACE_IDS.forEach((id, i) => {
   setTimeout(() => {
     void pollWorkspace(id, mcp)
-    setInterval(() => void pollWorkspace(id, mcp), POLL_INTERVAL_MS).unref()
+    // recursive setTimeout (vs setInterval) so each call gets its own
+    // random jitter. Drift-correcting setInterval is fine for clock
+    // accuracy but for load-spreading the per-tick randomness is the goal.
+    const tick = () => {
+      setTimeout(() => {
+        void pollWorkspace(id, mcp)
+        tick()
+      }, POLL_INTERVAL_MS + Math.random() * JITTER_MS).unref()
+    }
+    tick()
   }, i * 500)
 })
 
-// Clean shutdown — fire-and-forget a "disconnected" notice on each watched
-// workspace's A2A so peers don't sit waiting on a silent channel.
+// Shutdown — exits immediately. Drain semantics deferred to v0.2 (#4).
 const shutdown = (sig: string) => {
   process.stderr.write(`molecule channel: ${sig} — shutting down\n`)
   process.exit(0)
