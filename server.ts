@@ -40,6 +40,11 @@ import { z } from 'zod'
 import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
+import {
+  extractText,
+  buildReplyBody,
+  type ActivityEntry,
+} from './lib/notification.ts'
 
 // ─── Config ─────────────────────────────────────────────────────────────
 
@@ -135,20 +140,7 @@ process.on('uncaughtException', err => {
 // activity_logs is paged out at 30 days, so an honest seen-id set never
 // grows unbounded; new sessions start fresh.
 
-interface ActivityEntry {
-  id: string
-  workspace_id: string
-  activity_type: string
-  source_id: string | null
-  target_id: string | null
-  method: string | null
-  summary: string | null
-  request_body?: unknown
-  response_body?: unknown
-  status: string
-  error_detail: string | null
-  created_at: string
-}
+// ActivityEntry type moved to lib/notification.ts so it's importable by tests.
 
 const seenIds = new Map<string, Set<string>>()  // workspace_id → Set<activity.id>
 
@@ -210,56 +202,20 @@ async function pollWorkspace(workspaceId: string, mcp: Server): Promise<void> {
 }
 
 // ─── Notification emission ─────────────────────────────────────────────
-
-function extractText(act: ActivityEntry): string {
-  // request_body is what the platform's a2a_proxy logs when forwarding A2A
-  // to this workspace. Empirically (verified against workspace-server's
-  // logA2ASuccess in a2a_proxy_helpers.go on 2026-04-29), the shape varies:
-  //
-  //   1. JSON-RPC envelope (most common — what real peers send):
-  //        { jsonrpc, id, method: "message/send", params: { message: { parts: [...] } } }
-  //   2. JSON-RPC with params.parts directly (some legacy callers):
-  //        { jsonrpc, id, method, params: { parts: [...] } }
-  //   3. Shorthand body (canvas-side direct sends):
-  //        { parts: [...] }
-  //
-  // Walk the envelope in priority order. Fall back to act.summary so the peer
-  // message at least surfaces SOMETHING — silent-drop is the failure mode this
-  // helper exists to prevent.
-  const body = act.request_body as {
-    parts?: Array<{ type?: string; text?: string }>
-    params?: {
-      message?: { parts?: Array<{ type?: string; text?: string }> }
-      parts?: Array<{ type?: string; text?: string }>
-    }
-  } | undefined
-
-  const candidates = [
-    body?.params?.message?.parts,  // shape 1 — JSON-RPC w/ message wrapper
-    body?.params?.parts,           // shape 2 — JSON-RPC params.parts
-    body?.parts,                   // shape 3 — shorthand
-  ]
-  for (const parts of candidates) {
-    if (Array.isArray(parts)) {
-      // Log non-text parts skipped — image/file delivery deferred to v0.2
-      // (#7). Without this log, image-only messages silently fall through
-      // to the summary fallback and Claude has no idea content was dropped.
-      const nonText = parts.filter(p => p.type && p.type !== 'text').length
-      if (nonText > 0) {
-        process.stderr.write(
-          `molecule channel: ${nonText} non-text part(s) in ${act.id} skipped ` +
-          `(image/file delivery is v0.2)\n`,
-        )
-      }
-      const text = parts.filter(p => p.type === 'text').map(p => p.text ?? '').join('')
-      if (text) return text
-    }
-  }
-  return act.summary ?? '(empty A2A message)'
-}
+//
+// extractText + buildReplyBody (used in reply tool below) live in
+// lib/notification.ts so they're unit-testable. extractText returns
+// {text, nonTextSkipped} — we log skipped non-text parts here instead
+// of inside the pure helper.
 
 function emitNotification(mcp: Server, workspaceId: string, act: ActivityEntry): void {
-  const text = extractText(act)
+  const { text, nonTextSkipped } = extractText(act)
+  if (nonTextSkipped > 0) {
+    process.stderr.write(
+      `molecule channel: ${nonTextSkipped} non-text part(s) in ${act.id} skipped ` +
+      `(image/file delivery is v0.2)\n`,
+    )
+  }
   // Per the telegram channel reference: notifications/claude/channel is the
   // host's hook. content becomes the conversation turn; meta is structured
   // metadata Claude can reason about (workspace_id, peer_id, ts, etc.).
@@ -326,27 +282,10 @@ async function replyToWorkspace(args: z.infer<typeof ReplyArgsSchema>): Promise<
       `Configured: ${WORKSPACE_IDS.join(', ')}`
     )
   }
-  // A2A request shape — proper JSON-RPC 2.0 envelope as the platform's a2a_proxy
-  // expects. Empirically (verified 2026-04-29 against workspace-server's
-  // ProxyA2A handler), shorthand `{parts:[...]}` gets accepted but the platform
-  // strips params before forwarding to the peer's URL — the peer then sees an
-  // envelope with `params: null` and no message text. Wrapping in proper
-  // JSON-RPC preserves the message all the way through.
-  //
-  // `messageId` is generated client-side; the platform doesn't require it but
-  // peers may use it for idempotency / dedup. Random hex matches the a2a-sdk
-  // convention.
-  const body = {
-    jsonrpc: '2.0',
-    id: crypto.randomUUID(),
-    method: 'message/send',
-    params: {
-      message: {
-        messageId: crypto.randomUUID(),
-        parts: [{ type: 'text', text: args.text }],
-      },
-    },
-  }
+  // Build proper JSON-RPC 2.0 envelope (lib/notification.ts). Shorthand
+  // bodies get stripped by the platform's a2a_proxy before forwarding —
+  // see lib/notification.ts buildReplyBody docstring for the full story.
+  const body = buildReplyBody(args.text)
   const resp = await fetch(`${PLATFORM_URL}/workspaces/${args.peer_id}/a2a`, {
     method: 'POST',
     headers: {
