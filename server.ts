@@ -37,7 +37,7 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
-import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync, statSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 import {
@@ -54,9 +54,30 @@ const ENV_FILE = join(STATE_DIR, '.env')
 const PID_FILE = join(STATE_DIR, 'bot.pid')
 
 // Load ~/.claude/channels/molecule/.env into process.env. Real env wins.
+//
+// Mode check: warn loudly if the .env was created with default umask
+// (0644 typical) instead of locked-down 0600. We chmod 600 below, but
+// any window between operator-created-file and first plugin-run had the
+// token world-readable. If that window matters in the operator's threat
+// model (shared machine, multi-user host), they should rotate.
 // Plugin-spawned servers don't get an env block — this is where tokens live.
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 try {
+  // Pre-chmod mode check — surface a warning if the file was group/world-
+  // readable before this plugin run locked it down. Operators on shared
+  // hosts can decide whether to rotate the token.
+  try {
+    const mode = statSync(ENV_FILE).mode & 0o777
+    if (mode !== 0o600 && mode !== 0o400) {
+      process.stderr.write(
+        `molecule channel: WARNING — ${ENV_FILE} mode was ${mode.toString(8).padStart(3, '0')} ` +
+        `(expected 600). Locking down now, but if this host has untrusted users, ` +
+        `treat the token as compromised and rotate via canvas Settings.\n`,
+      )
+    }
+  } catch {
+    // statSync fails when file is missing — handled by the readFileSync below.
+  }
   // Token is a credential — lock to owner. No-op on Windows (would need ACLs).
   chmodSync(ENV_FILE, 0o600)
   for (const line of readFileSync(ENV_FILE, 'utf8').split('\n')) {
