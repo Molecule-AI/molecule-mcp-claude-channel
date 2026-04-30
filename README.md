@@ -136,7 +136,7 @@ A2A messages can carry `Part` entries with `url` and `media_type`. The MVP deliv
 
 ## Compatibility
 
-- **molecule-runtime/workspace-server**: requires `delivery_mode=poll` support (`/registry/register` + a2a_proxy short-circuit, molecule-core PRs #2348 + #2353) and the `since_id` cursor on `GET /activity` (PR #2354). All three shipped under issue #2339, available staging-onward. The plugin probes for cursor support on startup (sends a known-invalid UUID, expects `410 Gone`) and exits with code 2 if the platform predates PR #2354 — silent re-delivery is a worse failure mode than failing to start.
+- **molecule-runtime/workspace-server**: requires `delivery_mode=poll` support (`/registry/register` + a2a_proxy short-circuit, molecule-core PRs #2348 + #2353) and the `since_id` cursor on `GET /activity` (PR #2354). All three shipped under issue #2339, available staging-onward. The plugin probes for cursor support on startup (sends a known-invalid UUID, expects `410 Gone`) and exits with code 2 if the platform predates PR #2354 — silent re-delivery is a worse failure mode than failing to start. `401`/`403`/`404`/`5xx` from the probe are treated as inconclusive (orthogonal to cursor support — usually a token, workspace_id, or transient-network issue) and the plugin continues to the poll loop where the real failure surfaces with workspace-level context.
 - **Claude Code**: tested against the channel-plugin contract that expects `notifications/claude/channel` with `{content, meta}` (matches `@claude-plugins-official/telegram` v0.0.6).
 - **bun**: the MCP server runs under bun for fast startup; `package.json` `start` does `bun install --no-summary && bun server.ts` so no global install needed.
 

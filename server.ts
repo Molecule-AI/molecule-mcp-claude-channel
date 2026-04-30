@@ -37,7 +37,7 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
-import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync, renameSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync, renameSync, unlinkSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 
@@ -130,6 +130,23 @@ try {
   }
 } catch {}
 writeFileSync(PID_FILE, String(process.pid))
+
+// Unlink the PID file on every exit path — including process.exit(N)
+// from the cursor-support probe (v0.2.1) which doesn't go through the
+// SIGINT/SIGTERM handlers. Without this, a non-clean exit leaves a
+// stale pid in PID_FILE pointing at a dead pid; the next launch's
+// `process.kill(stale, 'SIGTERM')` (above) would deliver the signal to
+// whatever unrelated process now owns that PID — exactly the cross-
+// process-kill hazard the singleton lock exists to prevent. exit
+// listeners only run synchronous code; unlinkSync is the right tool.
+process.on('exit', () => {
+  try {
+    const owned = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
+    if (owned === process.pid) unlinkSync(PID_FILE)
+  } catch {
+    // Already gone, or another process took ownership — leave it alone.
+  }
+})
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -495,7 +512,7 @@ function emitNotification(mcp: Server, workspaceId: string, act: ActivityEntry):
 // ─── MCP server ─────────────────────────────────────────────────────────
 
 const mcp = new Server(
-  { name: 'molecule', version: '0.2.1' },
+  { name: 'molecule', version: '0.2.2' },
   { capabilities: { tools: {} } },
 )
 
@@ -621,29 +638,31 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
 loadCursors()
 
-const transport = new StdioServerTransport()
-await mcp.connect(transport)
-
-// Self-register each workspace as poll-mode BEFORE the first poll fires.
-// Sequenced (not Promise.all) so failures are surfaced one at a time and
-// the operator can spot which workspace's token is bad.
-if (AUTO_REGISTER_POLL) {
-  for (const id of WORKSPACE_IDS) {
-    await registerAsPoll(id)
-  }
-}
-
-// Compat probe: confirm the platform supports the since_id cursor before
-// we start the poll loop. We probe each workspace independently because
-// a multi-tenant deployment could theoretically have tenants on different
-// workspace-server image SHAs (rolling redeploy in progress, blue/green,
-// etc.). Any 'too_old' answer kills the channel — silent re-delivery is
-// the worst failure mode.
+// Compat probe FIRST — before we open the MCP transport or self-register
+// any workspaces. v0.2.1 had this probe AFTER mcp.connect+registerAsPoll,
+// which had two bugs:
+//   1. mcp.connect already finished the initialize handshake, so a
+//      probe-failure exit looked like "MCP server crashed mid-session"
+//      to Claude Code (which swallows the stderr explanation) instead of
+//      the cleaner "server failed to start" with the upgrade message.
+//   2. registerAsPoll() may have already mutated the platform's
+//      delivery_mode for a workspace whose workspace-server can't honor
+//      poll, leaving the workspace in a broken state if we then exit.
+// Probing first is purely a startup-ordering fix; the probe semantics
+// (410 → ok, 200 → too_old, anything else → inconclusive) are unchanged.
+//
+// Probes run in parallel (allSettled) — sequentially they were N × 15s
+// at worst, which adds up for multi-workspace channels. Order doesn't
+// matter for the verdict; we only care if any one came back too_old.
 {
+  const results = await Promise.allSettled(
+    WORKSPACE_IDS.map(id => probeCursorSupport(id).then(r => ({ id, r }))),
+  )
   let anyTooOld = false
-  for (const id of WORKSPACE_IDS) {
-    const result = await probeCursorSupport(id)
-    if (result === 'too_old') {
+  for (const settled of results) {
+    if (settled.status !== 'fulfilled') continue
+    const { id, r } = settled.value
+    if (r === 'too_old') {
       anyTooOld = true
       process.stderr.write(
         `molecule channel: workspace ${id} on a platform that predates ` +
@@ -658,7 +677,20 @@ if (AUTO_REGISTER_POLL) {
       `molecule channel: refusing to start in poll mode against an older platform. ` +
       `Pin MOLECULE_PLATFORM_URL to an upgraded tenant or downgrade to plugin v0.1.\n`
     )
+    // exit triggers the 'exit' listener, which unlinks the PID file.
     process.exit(2)
+  }
+}
+
+const transport = new StdioServerTransport()
+await mcp.connect(transport)
+
+// Self-register each workspace as poll-mode BEFORE the first poll fires.
+// Sequenced (not Promise.all) so failures are surfaced one at a time and
+// the operator can spot which workspace's token is bad.
+if (AUTO_REGISTER_POLL) {
+  for (const id of WORKSPACE_IDS) {
+    await registerAsPoll(id)
   }
 }
 
