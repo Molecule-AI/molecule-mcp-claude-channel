@@ -316,6 +316,55 @@ async function pollWorkspace(workspaceId: string, mcp: Server): Promise<void> {
   }
 }
 
+// ─── Cursor-support probe (startup compat check) ──────────────────────
+//
+// v0.2 relies on the since_id cursor on /activity (Molecule-AI/molecule-core
+// PR #2354). Older platforms silently ignore the query param and return
+// whatever the default time window covers, which would make us re-deliver
+// the same activities on every tick — a worse silent-duplicate bug than
+// any failure mode v0.1 had.
+//
+// Detect at startup with a known-invalid UUID. PR-#2354+ answers 410 Gone
+// for any cursor that doesn't resolve to an activity_logs row. Pre-#2354
+// servers ignore the param and answer 200 OK. We use the all-zero UUID
+// because gen_random_uuid() will never produce it (per RFC 4122 §4.4 the
+// version + variant bits are non-zero), so a 410 is unambiguous.
+//
+// Probe failure is fatal — the user MUST upgrade. Falling back to v0.1
+// behavior would re-introduce the message-loss-on-restart bug v0.2 was
+// written to fix; failing loudly is the better default.
+const PROBE_CURSOR = '00000000-0000-0000-0000-000000000000'
+
+async function probeCursorSupport(workspaceId: string): Promise<'ok' | 'too_old' | 'inconclusive'> {
+  const token = TOKEN_BY_WORKSPACE.get(workspaceId)!
+  const url = new URL(`${PLATFORM_URL}/workspaces/${workspaceId}/activity`)
+  url.searchParams.set('type', 'a2a_receive')
+  url.searchParams.set('since_id', PROBE_CURSOR)
+  url.searchParams.set('limit', '1')
+
+  let resp: Response
+  try {
+    resp = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}`, Origin: PLATFORM_URL },
+      signal: AbortSignal.timeout(15_000),
+    })
+  } catch (err) {
+    process.stderr.write(`molecule channel: probe ${workspaceId} fetch failed: ${err}\n`)
+    return 'inconclusive'
+  }
+
+  if (resp.status === 410) return 'ok'
+  if (resp.status === 200) return 'too_old'
+
+  // 401/403/404/5xx — orthogonal to cursor support. Probe is inconclusive;
+  // let the normal poll loop surface the real failure.
+  process.stderr.write(
+    `molecule channel: probe ${workspaceId} returned HTTP ${resp.status} (expected 410); ` +
+    `cursor support unverifiable, continuing\n`
+  )
+  return 'inconclusive'
+}
+
 // ─── Register-as-poll (startup self-register) ──────────────────────────
 //
 // On startup, register each watched workspace with delivery_mode=poll so
@@ -446,7 +495,7 @@ function emitNotification(mcp: Server, workspaceId: string, act: ActivityEntry):
 // ─── MCP server ─────────────────────────────────────────────────────────
 
 const mcp = new Server(
-  { name: 'molecule', version: '0.1.0' },
+  { name: 'molecule', version: '0.2.1' },
   { capabilities: { tools: {} } },
 )
 
@@ -581,6 +630,35 @@ await mcp.connect(transport)
 if (AUTO_REGISTER_POLL) {
   for (const id of WORKSPACE_IDS) {
     await registerAsPoll(id)
+  }
+}
+
+// Compat probe: confirm the platform supports the since_id cursor before
+// we start the poll loop. We probe each workspace independently because
+// a multi-tenant deployment could theoretically have tenants on different
+// workspace-server image SHAs (rolling redeploy in progress, blue/green,
+// etc.). Any 'too_old' answer kills the channel — silent re-delivery is
+// the worst failure mode.
+{
+  let anyTooOld = false
+  for (const id of WORKSPACE_IDS) {
+    const result = await probeCursorSupport(id)
+    if (result === 'too_old') {
+      anyTooOld = true
+      process.stderr.write(
+        `molecule channel: workspace ${id} on a platform that predates ` +
+        `since_id cursor support (Molecule-AI/molecule-core PR #2354).\n` +
+        `  Symptom would be: every poll re-delivers all recent activity as if it were new.\n` +
+        `  Fix: upgrade workspace-server to a build with /activity ?since_id=… support.\n`
+      )
+    }
+  }
+  if (anyTooOld) {
+    process.stderr.write(
+      `molecule channel: refusing to start in poll mode against an older platform. ` +
+      `Pin MOLECULE_PLATFORM_URL to an upgraded tenant or downgrade to plugin v0.1.\n`
+    )
+    process.exit(2)
   }
 }
 
