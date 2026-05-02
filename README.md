@@ -87,6 +87,9 @@ When a peer's message lands in your session, the meta block carries the routing 
       "workspace_id": "ws-uuid-1",
       "watching_as": "ws-uuid-1",
       "peer_id": "ws-uuid-pm-coordinator",
+      "peer_name": "ops-agent",
+      "peer_role": "sre",
+      "agent_card_url": "https://your-tenant.staging.moleculesai.app/registry/discover/ws-uuid-pm-coordinator",
       "method": "user_message",
       "activity_id": "act-...",
       "ts": "2026-04-29T..."
@@ -94,6 +97,8 @@ When a peer's message lands in your session, the meta block carries the routing 
   }
 }
 ```
+
+> **Compatibility note (2026-05-02):** the platform now enriches the inbound envelope with three additional fields — `peer_name` (peer's display name, registry-resolved), `peer_role` (peer's declared role, same registry source), and `agent_card_url` (deterministic URL of the platform's discover endpoint for this peer). `peer_name` and `peer_role` may be absent when the registry lookup fails (e.g. the peer hasn't registered yet); `agent_card_url` is always populated because it's computed deterministically from `peer_id`. Pre-2026-05-02 platforms do not emit these fields — the plugin forwards whatever the platform sends, so older payloads continue to work unchanged. See <https://doc.moleculesai.app/docs/runtime-mcp> for the full envelope spec.
 
 Claude can call `reply_to_workspace({peer_id, text})` to send the response back. If only one workspace is watched, `workspace_id` is implicit. Multi-workspace setups need the watched id explicitly.
 
