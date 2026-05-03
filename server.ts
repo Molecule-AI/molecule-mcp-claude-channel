@@ -41,6 +41,7 @@ import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync, renameSy
 import { homedir } from 'os'
 import { join } from 'path'
 import { extractText, type ActivityEntry } from './extract-text.ts'
+import { formatRemovedWorkspaceError } from './error-format.ts'
 
 // ─── Config ─────────────────────────────────────────────────────────────
 
@@ -691,19 +692,11 @@ const GetWorkspaceInfoArgsSchema = z.object({
   ).optional(),
 })
 
-// Pure formatter — kept exportable so server.test.ts can pin the
-// message shape without mocking fetch + resolveWatching just to read
-// one string. molecule-core#2429.
-export function formatRemovedWorkspaceError(
-  workspaceId: string,
-  body: { id?: string; removed_at?: string; hint?: string } | null | undefined,
-): string {
-  const safeBody = body ?? {}
-  const id = safeBody.id ?? workspaceId
-  const hint = safeBody.hint ?? 'Regenerate workspace + token from the canvas → Tokens tab.'
-  const removed = safeBody.removed_at ? ` at ${safeBody.removed_at}` : ''
-  return `Workspace ${id} was deleted on the platform${removed}. ${hint}`
-}
+// Re-exported from error-format.ts so existing server.ts callers keep
+// working. The helper lives in its own module so server.test.ts can
+// import it without booting server.ts (which exits on missing env).
+// molecule-core#2429.
+export { formatRemovedWorkspaceError } from './error-format.ts'
 
 async function getWorkspaceInfo(args: z.infer<typeof GetWorkspaceInfoArgsSchema>): Promise<unknown> {
   const { workspaceId, token } = resolveWatching(args._as_workspace)

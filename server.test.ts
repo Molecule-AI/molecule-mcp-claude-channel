@@ -8,7 +8,12 @@
 // "HTTP 410" error we used to surface.
 
 import { describe, expect, it } from 'bun:test'
-import { formatRemovedWorkspaceError } from './server.ts'
+// Imports from ./error-format.ts (not ./server.ts) so the test doesn't
+// trigger server.ts's boot-time env validation, PID-file lock, MCP
+// transport connect, or top-level await on missing MOLECULE_* env. The
+// import-time process.exit(1) made this test file uncatchable in CI
+// (where MOLECULE_PLATFORM_URL et al. are unset).
+import { formatRemovedWorkspaceError } from './error-format.ts'
 
 describe('formatRemovedWorkspaceError — 410 Gone handling (#2429)', () => {
   it('prefers the platform-supplied id, removed_at, and hint when present', () => {
