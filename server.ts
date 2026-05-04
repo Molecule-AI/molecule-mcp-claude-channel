@@ -42,6 +42,8 @@ import { homedir } from 'os'
 import { join } from 'path'
 import { extractText, type ActivityEntry } from './extract-text.ts'
 import { formatRemovedWorkspaceError } from './error-format.ts'
+import { agentCardUrlFor, enrichPeerMetadata, validatePeerId } from './peer-enrich.ts'
+import { formatChannelContent } from './format-content.ts'
 
 // ─── Config ─────────────────────────────────────────────────────────────
 
@@ -311,7 +313,12 @@ async function pollWorkspace(workspaceId: string, mcp: Server): Promise<void> {
   // notification delivery is best-effort anyway.
   if (activities.length === 0) return
   for (const act of activities) {
-    emitNotification(mcp, workspaceId, act)
+    // Fire-and-forget — enrichPeerMetadata adds a registry GET (cached)
+    // to the emit path, but the cursor must advance regardless of emit
+    // success or registry availability. Inner chain logs its own errors
+    // to stderr; we don't await here so a stalled registry can't block
+    // sibling messages or stall the cursor advance below.
+    void emitNotification(mcp, workspaceId, act)
   }
   const newest = activities[activities.length - 1].id
   if (newest !== cursor) {
@@ -433,7 +440,7 @@ async function registerAsPoll(workspaceId: string): Promise<void> {
 
 // ─── Notification emission ─────────────────────────────────────────────
 
-function emitNotification(mcp: Server, workspaceId: string, act: ActivityEntry): void {
+async function emitNotification(mcp: Server, workspaceId: string, act: ActivityEntry): Promise<void> {
   const text = extractText(act)
   // Discriminate canvas-user messages (typed in the canvas chat panel) from
   // peer-agent A2A traffic. The canvas wraps user chat as JSON-RPC
@@ -441,29 +448,79 @@ function emitNotification(mcp: Server, workspaceId: string, act: ActivityEntry):
   // in source_id. The reply tool routes differently on this — canvas_user
   // → /notify (lands in the user's chat), peer_agent → /a2a (proper JSON-RPC
   // response to the calling peer).
-  const peerId = act.source_id ?? ''
-  const kind: 'canvas_user' | 'peer_agent' = peerId ? 'peer_agent' : 'canvas_user'
+  const rawPeerId = act.source_id ?? ''
+  const kind: 'canvas_user' | 'peer_agent' = rawPeerId ? 'peer_agent' : 'canvas_user'
+
+  // peer_id passes through validatePeerId so a malformed id (control bytes,
+  // path traversal, embedded quotes) is reflected as empty rather than
+  // poisoning the meta envelope or registry URL. Same trust boundary the
+  // Python side enforces in _validate_peer_id.
+  const peerId = kind === 'peer_agent' ? (validatePeerId(rawPeerId) ?? '') : ''
+
+  // Registry enrichment for peer_agent pushes — the README has documented
+  // peer_name/peer_role/agent_card_url since 2026-05-02 PR #23 but the code
+  // never populated them. Lookup is TTL-cached (5 min), negative-cached on
+  // failure, and falls back to bare peer_id on any error so the push path
+  // never blocks on a registry stall. Skip for canvas_user (no peer to
+  // resolve) and for malformed peer_ids (validatePeerId returned empty).
+  let peerName: string | undefined
+  let peerRole: string | undefined
+  let agentCardUrl = ''
+  if (peerId) {
+    const watchingToken = TOKEN_BY_WORKSPACE.get(workspaceId)
+    if (watchingToken !== undefined) {
+      const record = await enrichPeerMetadata(peerId, PLATFORM_URL!, watchingToken).catch(() => null)
+      if (record !== null) {
+        if (typeof record.name === 'string' && record.name.length > 0) peerName = record.name
+        if (typeof record.role === 'string' && record.role.length > 0) peerRole = record.role
+      }
+    }
+    // agent_card_url is constructable from peer_id alone — surface it even
+    // when registry lookup fails so Claude has a single endpoint to hit
+    // for capabilities. Empty string is impossible here because peerId
+    // already passed validatePeerId above.
+    agentCardUrl = agentCardUrlFor(peerId, PLATFORM_URL!)
+  }
+
+  // Compose the conversation-turn text Claude actually sees. Header carries
+  // peer identity (resolved name + role when available, peer_id always);
+  // footer carries the exact reply_to_workspace call shape so the model
+  // doesn't have to remember it. See format-content.ts for the rationale +
+  // tradeoff on coupling display to behaviour.
+  const content = formatChannelContent({
+    text,
+    kind,
+    watchingAs: workspaceId,
+    peerId,
+    peerName,
+    peerRole,
+  })
 
   // Per the telegram channel reference: notifications/claude/channel is the
   // host's hook. content becomes the conversation turn; meta is structured
   // metadata Claude can reason about (workspace_id, peer_id, ts, etc.).
   // image_path / attachment_* mirror telegram's shape so the host's
   // attachment handling works without a custom path.
-  mcp.notification({
+  const meta: Record<string, string> = {
+    source: 'molecule',
+    kind,
+    workspace_id: act.workspace_id,
+    watching_as: workspaceId,
+    peer_id: peerId,
+    method: act.method ?? '',
+    activity_id: act.id,
+    ts: act.created_at,
+  }
+  // Only emit the enriched fields when we have them — absent vs empty is
+  // a meaningful distinction for downstream consumers (matches the
+  // Python helper's dict.get-friendly shape).
+  if (peerName !== undefined) meta.peer_name = peerName
+  if (peerRole !== undefined) meta.peer_role = peerRole
+  if (agentCardUrl) meta.agent_card_url = agentCardUrl
+
+  await mcp.notification({
     method: 'notifications/claude/channel',
-    params: {
-      content: text,
-      meta: {
-        source: 'molecule',
-        kind,
-        workspace_id: act.workspace_id,
-        watching_as: workspaceId,
-        peer_id: peerId,
-        method: act.method ?? '',
-        activity_id: act.id,
-        ts: act.created_at,
-      },
-    },
+    params: { content, meta },
   }).catch(err => {
     process.stderr.write(`molecule channel: failed to deliver notification for ${act.id}: ${err}\n`)
   })
