@@ -75,13 +75,13 @@ curl -X POST "$MOLECULE_PLATFORM_URL/admin/workspaces/$WORKSPACE_ID/tokens" \
 
 ## How replies work
 
-When a peer's message lands in your session, the meta block carries the routing data Claude needs:
+When a peer's message lands in your session, both the rendered `content` and the structured `meta` block carry the routing data Claude needs:
 
 ```json
 {
   "method": "notifications/claude/channel",
   "params": {
-    "content": "Hey, can you take a look at this? <issue body>",
+    "content": "[from ops-agent (sre) · peer_id=ws-uuid-pm-coordinator · watching=ws-uuid-1]\nHey, can you take a look at this? <issue body>\n↩ Reply: reply_to_workspace({workspace_id: \"ws-uuid-1\", peer_id: \"ws-uuid-pm-coordinator\", text: \"...\"})",
     "meta": {
       "source": "molecule",
       "workspace_id": "ws-uuid-1",
@@ -98,9 +98,16 @@ When a peer's message lands in your session, the meta block carries the routing 
 }
 ```
 
-> **Compatibility note (2026-05-02):** the platform now enriches the inbound envelope with three additional fields — `peer_name` (peer's display name, registry-resolved), `peer_role` (peer's declared role, same registry source), and `agent_card_url` (deterministic URL of the platform's discover endpoint for this peer). `peer_name` and `peer_role` may be absent when the registry lookup fails (e.g. the peer hasn't registered yet); `agent_card_url` is always populated because it's computed deterministically from `peer_id`. Pre-2026-05-02 platforms do not emit these fields — the plugin forwards whatever the platform sends, so older payloads continue to work unchanged. See <https://doc.moleculesai.app/docs/runtime-mcp> for the full envelope spec.
+`content` is the conversation turn Claude reads. The plugin wraps the raw inbound text with two extra lines:
 
-Claude can call `reply_to_workspace({peer_id, text})` to send the response back. If only one workspace is watched, `workspace_id` is implicit. Multi-workspace setups need the watched id explicitly.
+- A header (`[from <identity> · peer_id=<uuid> · watching=<uuid>]`) so Claude can tell who's talking without parsing `meta`.
+- A reply hint (`↩ Reply: reply_to_workspace({...})`) showing the exact tool call shape needed to respond. Routing differs by sender kind:
+  - **canvas_user** (typed in the canvas chat) → `reply_to_workspace({workspace_id, text})` — no `peer_id`, lands in the user's chat panel.
+  - **peer_agent** (A2A from another workspace) → `reply_to_workspace({workspace_id, peer_id, text})` — sends a JSON-RPC reply to the calling peer.
+
+`peer_name` and `peer_role` come from the registry (`/registry/discover/<peer_id>`) and are sanitised before being interpolated into `content` — control characters, brackets, and newlines are stripped to prevent a maliciously-registered name from injecting pseudo-instructions into the conversation turn. Both fields may be absent if the registry lookup fails (e.g. the peer hasn't registered yet); `agent_card_url` is always populated because it's computed deterministically from `peer_id`.
+
+Single-watch setups can omit `workspace_id` from the reply call (it defaults to the only watched workspace). Multi-workspace setups need it explicitly — the header surfaces it so Claude doesn't have to guess.
 
 ## Architecture notes
 
