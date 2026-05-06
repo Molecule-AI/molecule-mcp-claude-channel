@@ -44,6 +44,7 @@ import { extractText, type ActivityEntry } from './extract-text.ts'
 import { formatRemovedWorkspaceError } from './error-format.ts'
 import { agentCardUrlFor, enrichPeerMetadata, validatePeerId } from './peer-enrich.ts'
 import { formatChannelContent, sanitizeIdentityField } from './format-content.ts'
+import { resolvePlatformUrls } from './platform-urls.ts'
 
 // ─── Config ─────────────────────────────────────────────────────────────
 
@@ -66,11 +67,27 @@ try {
   // Missing .env on first run is fine; we'll fail loudly below if required vars are absent.
 }
 
-const PLATFORM_URL = process.env.MOLECULE_PLATFORM_URL?.replace(/\/$/, '')
 const WORKSPACE_IDS = (process.env.MOLECULE_WORKSPACE_IDS ?? '')
   .split(',').map(s => s.trim()).filter(Boolean)
 const WORKSPACE_TOKENS = (process.env.MOLECULE_WORKSPACE_TOKENS ?? '')
   .split(',').map(s => s.trim()).filter(Boolean)
+// MOLECULE_PLATFORM_URLS (plural) is the per-workspace shape: same-order
+// comma-separated list, one URL per WORKSPACE_ID. MOLECULE_PLATFORM_URL
+// (singular) keeps working for back-compat with single-tenant configs —
+// when set without the plural, the single URL fans out to every watched
+// workspace (preserves pre-v0.4 behavior verbatim). When BOTH are set,
+// the plural wins and singular is ignored.
+//
+// Multi-tenant motivation (closes Molecule-AI/molecule-core#3013 issue 4):
+// users running watched workspaces across multiple Molecule tenants
+// (personal subdomain + team subdomain) couldn't watch them with one
+// plugin install — pre-v0.4 the single PLATFORM_URL forced one tenant.
+//
+// Resolution + parity check live in `resolvePlatformUrls` (./platform-urls.ts)
+// so the same logic is exercised by tests without booting server.ts.
+const PLATFORM_URLS_RAW = (process.env.MOLECULE_PLATFORM_URLS ?? '')
+  .split(',').map(s => s.trim()).map(s => s.replace(/\/$/, '')).filter(Boolean)
+const PLATFORM_URL_FALLBACK = process.env.MOLECULE_PLATFORM_URL?.replace(/\/$/, '')
 const POLL_INTERVAL_MS = parseInt(process.env.MOLECULE_POLL_INTERVAL_MS ?? '5000', 10)
 // POLL_WINDOW_SECS is only used for the initial "watch from now" cursor seed
 // — after that, the cursor (since_id) drives every subsequent poll. Older
@@ -92,7 +109,7 @@ const AUTO_REGISTER_POLL = !['0', 'false', 'no'].includes(
   (process.env.MOLECULE_AUTO_REGISTER_POLL ?? 'true').toLowerCase()
 )
 
-if (!PLATFORM_URL || WORKSPACE_IDS.length === 0 || WORKSPACE_TOKENS.length === 0) {
+if (WORKSPACE_IDS.length === 0 || WORKSPACE_TOKENS.length === 0) {
   process.stderr.write(
     `molecule channel: required config missing\n` +
     `  set in ${ENV_FILE}\n` +
@@ -100,6 +117,9 @@ if (!PLATFORM_URL || WORKSPACE_IDS.length === 0 || WORKSPACE_TOKENS.length === 0
     `    MOLECULE_PLATFORM_URL=https://your-tenant.staging.moleculesai.app\n` +
     `    MOLECULE_WORKSPACE_IDS=ws-uuid-1,ws-uuid-2\n` +
     `    MOLECULE_WORKSPACE_TOKENS=tok-1,tok-2\n` +
+    `  multi-tenant (per-workspace URL):\n` +
+    `    MOLECULE_PLATFORM_URLS=https://tenant-a.../,https://tenant-b.../\n` +
+    `    (same order as MOLECULE_WORKSPACE_IDS; replaces MOLECULE_PLATFORM_URL)\n` +
     `  optional:\n` +
     `    MOLECULE_POLL_INTERVAL_MS=5000\n` +
     `    MOLECULE_POLL_WINDOW_SECS=30\n`
@@ -114,9 +134,45 @@ if (WORKSPACE_IDS.length !== WORKSPACE_TOKENS.length) {
   process.exit(1)
 }
 
+const urlResolution = resolvePlatformUrls({
+  workspaceIds: WORKSPACE_IDS,
+  platformUrls: PLATFORM_URLS_RAW,
+  platformUrl: PLATFORM_URL_FALLBACK,
+})
+if (!urlResolution.ok) {
+  process.stderr.write(`molecule channel: ${urlResolution.message}\n`)
+  process.exit(1)
+}
+const PLATFORM_URLS = urlResolution.urls
+
 const TOKEN_BY_WORKSPACE = new Map<string, string>(
   WORKSPACE_IDS.map((id, i) => [id, WORKSPACE_TOKENS[i]])
 )
+// URL_BY_WORKSPACE holds the per-workspace platform URL after
+// resolvePlatformUrls' parity check. Lookup with urlFor() — every
+// site that talks to the platform threads workspaceId so the
+// multi-tenant case routes correctly.
+const URL_BY_WORKSPACE = new Map<string, string>(
+  WORKSPACE_IDS.map((id, i) => [id, PLATFORM_URLS[i]])
+)
+
+/**
+ * urlFor — the single SSOT for "which platform URL does this watched
+ * workspace live on". Throws if workspaceId isn't a watched id —
+ * defensive, since by construction the maps are populated from
+ * WORKSPACE_IDS, but a future caller passing peer_id (NOT a watched
+ * id) would silently fan the wrong way without this check.
+ */
+function urlFor(workspaceId: string): string {
+  const u = URL_BY_WORKSPACE.get(workspaceId)
+  if (!u) {
+    throw new Error(
+      `urlFor: ${workspaceId} is not a watched workspace_id; ` +
+      `configured: ${WORKSPACE_IDS.join(', ')}`
+    )
+  }
+  return u
+}
 
 // ─── Singleton lock ─────────────────────────────────────────────────────
 //
@@ -231,7 +287,8 @@ function saveCursors(): void {
 
 async function pollWorkspace(workspaceId: string, mcp: Server): Promise<void> {
   const token = TOKEN_BY_WORKSPACE.get(workspaceId)!
-  const url = new URL(`${PLATFORM_URL}/workspaces/${workspaceId}/activity`)
+  const platformUrl = urlFor(workspaceId)
+  const url = new URL(`${platformUrl}/workspaces/${workspaceId}/activity`)
   url.searchParams.set('type', 'a2a_receive')
   url.searchParams.set('limit', '100')
 
@@ -264,9 +321,11 @@ async function pollWorkspace(workspaceId: string, mcp: Server): Promise<void> {
         // /workspaces/* returns an empty 404 (it's silently routed to the
         // canvas Next.js, which has no /workspaces page). Node/Bun fetch
         // doesn't auto-set Origin (that's a browser-only concern), so we
-        // set it explicitly to PLATFORM_URL — the only origin the bearer
-        // is valid against anyway, so no risk of leaking it elsewhere.
-        Origin: PLATFORM_URL,
+        // set it explicitly to the workspace's platform URL — the only
+        // origin the bearer is valid against anyway, so no risk of
+        // leaking it elsewhere. urlFor(workspaceId) is the SSOT for
+        // multi-tenant routing (closes #3013 issue 4).
+        Origin: platformUrl,
       },
       signal: AbortSignal.timeout(10_000),
     })
@@ -348,7 +407,8 @@ const PROBE_CURSOR = '00000000-0000-0000-0000-000000000000'
 
 async function probeCursorSupport(workspaceId: string): Promise<'ok' | 'too_old' | 'inconclusive'> {
   const token = TOKEN_BY_WORKSPACE.get(workspaceId)!
-  const url = new URL(`${PLATFORM_URL}/workspaces/${workspaceId}/activity`)
+  const platformUrl = urlFor(workspaceId)
+  const url = new URL(`${platformUrl}/workspaces/${workspaceId}/activity`)
   url.searchParams.set('type', 'a2a_receive')
   url.searchParams.set('since_id', PROBE_CURSOR)
   url.searchParams.set('limit', '1')
@@ -356,7 +416,7 @@ async function probeCursorSupport(workspaceId: string): Promise<'ok' | 'too_old'
   let resp: Response
   try {
     resp = await fetch(url, {
-      headers: { Authorization: `Bearer ${token}`, Origin: PLATFORM_URL },
+      headers: { Authorization: `Bearer ${token}`, Origin: platformUrl },
       signal: AbortSignal.timeout(15_000),
     })
   } catch (err) {
@@ -390,6 +450,7 @@ async function probeCursorSupport(workspaceId: string): Promise<'ok' | 'too_old'
 // block channel startup. Log loudly so misconfiguration is visible.
 async function registerAsPoll(workspaceId: string): Promise<void> {
   const token = TOKEN_BY_WORKSPACE.get(workspaceId)!
+  const platformUrl = urlFor(workspaceId)
   const body = {
     id: workspaceId,
     delivery_mode: 'poll',
@@ -400,12 +461,12 @@ async function registerAsPoll(workspaceId: string): Promise<void> {
   }
   let resp: Response
   try {
-    resp = await fetch(`${PLATFORM_URL}/registry/register`, {
+    resp = await fetch(`${platformUrl}/registry/register`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
-        Origin: PLATFORM_URL,
+        Origin: platformUrl,
       },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(15_000),
@@ -468,8 +529,13 @@ async function emitNotification(mcp: Server, workspaceId: string, act: ActivityE
   let agentCardUrl = ''
   if (peerId) {
     const watchingToken = TOKEN_BY_WORKSPACE.get(workspaceId)
+    // Registry lookup goes against the WATCHING workspace's tenant — peer
+    // discovery is scoped to the watching workspace's view (siblings,
+    // children, parent). In multi-tenant mode that's the right URL to
+    // use; in single-tenant it collapses to the broadcast URL.
+    const watchingPlatformUrl = urlFor(workspaceId)
     if (watchingToken !== undefined) {
-      const record = await enrichPeerMetadata(peerId, PLATFORM_URL!, watchingToken).catch(() => null)
+      const record = await enrichPeerMetadata(peerId, watchingPlatformUrl, watchingToken).catch(() => null)
       if (record !== null) {
         // Sanitise here so the value stored in `meta` (which downstream
         // tooling, dashboards, audit logs may consume) is also safe —
@@ -485,8 +551,9 @@ async function emitNotification(mcp: Server, workspaceId: string, act: ActivityE
     // agent_card_url is constructable from peer_id alone — surface it even
     // when registry lookup fails so Claude has a single endpoint to hit
     // for capabilities. Empty string is impossible here because peerId
-    // already passed validatePeerId above.
-    agentCardUrl = agentCardUrlFor(peerId, PLATFORM_URL!)
+    // already passed validatePeerId above. Construct against the watching
+    // workspace's tenant URL (same reason as enrichPeerMetadata above).
+    agentCardUrl = agentCardUrlFor(peerId, watchingPlatformUrl)
   }
 
   // Compose the conversation-turn text Claude actually sees. Header carries
@@ -585,17 +652,24 @@ async function replyToWorkspace(args: z.infer<typeof ReplyArgsSchema>): Promise<
     )
   }
 
+  // platformUrl is the WATCHING workspace's tenant — both reply paths
+  // (canvas notify + peer A2A) use the watching workspace's bearer, so
+  // they hit the same tenant origin. In multi-tenant mode this differs
+  // per watched workspace (closes #3013 issue 4); in single-tenant mode
+  // it collapses to the broadcast URL.
+  const platformUrl = urlFor(workspace_id)
+
   const peerId = args.peer_id?.trim() ?? ''
   if (!peerId) {
     // Canvas-user reply — POST /workspaces/:our/notify with {message: text}.
     // The platform appends to the user-facing chat panel; no JSON-RPC envelope
     // because there's no peer URL on the other side, just the canvas UI.
-    const resp = await fetch(`${PLATFORM_URL}/workspaces/${workspace_id}/notify`, {
+    const resp = await fetch(`${platformUrl}/workspaces/${workspace_id}/notify`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
-        Origin: PLATFORM_URL,
+        Origin: platformUrl,
       },
       body: JSON.stringify({ message: args.text }),
       signal: AbortSignal.timeout(30_000),
@@ -627,7 +701,7 @@ async function replyToWorkspace(args: z.infer<typeof ReplyArgsSchema>): Promise<
       },
     },
   }
-  const resp = await fetch(`${PLATFORM_URL}/workspaces/${peerId}/a2a`, {
+  const resp = await fetch(`${platformUrl}/workspaces/${peerId}/a2a`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
@@ -635,8 +709,9 @@ async function replyToWorkspace(args: z.infer<typeof ReplyArgsSchema>): Promise<
       'X-Source-Workspace-Id': workspace_id,
       // Same-origin header for SaaS edge WAF — see pollWorkspace fetch
       // for the full explanation. /workspaces/* requires it on hosted
-      // tenants; localhost ignores it.
-      Origin: PLATFORM_URL,
+      // tenants; localhost ignores it. platformUrl is the WATCHING
+      // workspace's tenant — same place the bearer is valid against.
+      Origin: platformUrl,
     },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(30_000),
@@ -655,7 +730,7 @@ async function replyToWorkspace(args: z.infer<typeof ReplyArgsSchema>): Promise<
 // target. When watching exactly one workspace it's an obvious default;
 // for multi-watch, the caller must specify.
 
-function resolveWatching(asWorkspaceId?: string): { workspaceId: string; token: string } {
+function resolveWatching(asWorkspaceId?: string): { workspaceId: string; token: string; platformUrl: string } {
   let workspaceId = asWorkspaceId
   if (!workspaceId) {
     if (WORKSPACE_IDS.length === 1) workspaceId = WORKSPACE_IDS[0]
@@ -671,15 +746,25 @@ function resolveWatching(asWorkspaceId?: string): { workspaceId: string; token: 
       `Configured: ${WORKSPACE_IDS.join(', ')}`
     )
   }
-  return { workspaceId, token }
+  // platformUrl is the per-workspace tenant URL (closes #3013 issue 4).
+  // Threaded through every tool helper so multi-tenant routing is the
+  // structural default — there's no global PLATFORM_URL to fall back to.
+  const platformUrl = urlFor(workspaceId)
+  return { workspaceId, token, platformUrl }
 }
 
 // Standard auth headers shared by every platform call. Origin is required
 // by the SaaS edge WAF — see pollWorkspace's fetch for the full story.
-function platformHeaders(token: string, extra: Record<string, string> = {}): Record<string, string> {
+//
+// originUrl: same value the caller is using as the request origin —
+// in v0.4 multi-tenant mode this varies per watched workspace, so it
+// can't be a global constant anymore. Callers thread the URL they got
+// from urlFor(workspaceId) through here so that `Origin` matches the
+// scheme+host the request is targeting.
+function platformHeaders(token: string, originUrl: string, extra: Record<string, string> = {}): Record<string, string> {
   return {
     Authorization: `Bearer ${token}`,
-    Origin: PLATFORM_URL!,
+    Origin: originUrl,
     ...extra,
   }
 }
@@ -728,12 +813,13 @@ async function listPeers(args: z.infer<typeof ListPeersArgsSchema>): Promise<Pee
       `Configured: ${WORKSPACE_IDS.join(', ')}`
     )
   }
-  const url = new URL(`${PLATFORM_URL}/registry/${workspace_id}/peers`)
+  const platformUrl = urlFor(workspace_id)
+  const url = new URL(`${platformUrl}/registry/${workspace_id}/peers`)
   if (args.q) url.searchParams.set('q', args.q)
   const resp = await fetch(url, {
     headers: {
       Authorization: `Bearer ${token}`,
-      Origin: PLATFORM_URL,
+      Origin: platformUrl,
     },
     signal: AbortSignal.timeout(15_000),
   })
@@ -763,9 +849,9 @@ const GetWorkspaceInfoArgsSchema = z.object({
 export { formatRemovedWorkspaceError } from './error-format.ts'
 
 async function getWorkspaceInfo(args: z.infer<typeof GetWorkspaceInfoArgsSchema>): Promise<unknown> {
-  const { workspaceId, token } = resolveWatching(args._as_workspace)
-  const resp = await fetch(`${PLATFORM_URL}/workspaces/${workspaceId}`, {
-    headers: platformHeaders(token),
+  const { workspaceId, token, platformUrl } = resolveWatching(args._as_workspace)
+  const resp = await fetch(`${platformUrl}/workspaces/${workspaceId}`, {
+    headers: platformHeaders(token, platformUrl),
     signal: AbortSignal.timeout(15_000),
   })
   if (resp.status === 410) {
@@ -815,7 +901,7 @@ const SendMessageToUserArgsSchema = z.object({
 })
 
 async function sendMessageToUser(args: z.infer<typeof SendMessageToUserArgsSchema>): Promise<string> {
-  const { workspaceId, token } = resolveWatching(args._as_workspace)
+  const { workspaceId, token, platformUrl } = resolveWatching(args._as_workspace)
   let attachmentRefs: unknown[] = []
   if (args.attachments && args.attachments.length > 0) {
     // Multipart upload — same shape as workspace/a2a_tools.py:_upload_chat_files.
@@ -830,9 +916,9 @@ async function sendMessageToUser(args: z.infer<typeof SendMessageToUserArgsSchem
       // Bun.file is a Blob; FormData accepts Blob with filename.
       form.append('files', file, path.split('/').pop() ?? 'attachment')
     }
-    const upResp = await fetch(`${PLATFORM_URL}/workspaces/${workspaceId}/chat/uploads`, {
+    const upResp = await fetch(`${platformUrl}/workspaces/${workspaceId}/chat/uploads`, {
       method: 'POST',
-      headers: platformHeaders(token),
+      headers: platformHeaders(token, platformUrl),
       body: form,
       signal: AbortSignal.timeout(60_000),
     })
@@ -845,9 +931,9 @@ async function sendMessageToUser(args: z.infer<typeof SendMessageToUserArgsSchem
   }
   const body: Record<string, unknown> = { message: args.message }
   if (attachmentRefs.length > 0) body.attachments = attachmentRefs
-  const resp = await fetch(`${PLATFORM_URL}/workspaces/${workspaceId}/notify`, {
+  const resp = await fetch(`${platformUrl}/workspaces/${workspaceId}/notify`, {
     method: 'POST',
-    headers: platformHeaders(token, { 'Content-Type': 'application/json' }),
+    headers: platformHeaders(token, platformUrl, { 'Content-Type': 'application/json' }),
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(30_000),
   })
@@ -875,7 +961,7 @@ const DelegateTaskArgsSchema = z.object({
 })
 
 async function delegateTask(args: z.infer<typeof DelegateTaskArgsSchema>): Promise<unknown> {
-  const { workspaceId, token } = resolveWatching(args._as_workspace)
+  const { workspaceId, token, platformUrl } = resolveWatching(args._as_workspace)
   if (!args.workspace_id) throw new Error('workspace_id (target peer) is required')
   if (!args.task) throw new Error('task is required')
   const body = {
@@ -891,9 +977,13 @@ async function delegateTask(args: z.infer<typeof DelegateTaskArgsSchema>): Promi
   }
   // 60s timeout because sync delegation waits for the peer to actually
   // produce a response. Long-running peer work should use the async path.
-  const resp = await fetch(`${PLATFORM_URL}/workspaces/${args.workspace_id}/a2a`, {
+  // Hits the WATCHING workspace's tenant — same-tenant constraint on
+  // delegate_task. Cross-tenant delegation (peer on a different tenant
+  // than the watching workspace) is out of scope; the platform's
+  // a2a_proxy is single-tenant.
+  const resp = await fetch(`${platformUrl}/workspaces/${args.workspace_id}/a2a`, {
     method: 'POST',
-    headers: platformHeaders(token, {
+    headers: platformHeaders(token, platformUrl, {
       'Content-Type': 'application/json',
       'X-Source-Workspace-Id': workspaceId,
     }),
@@ -922,16 +1012,16 @@ async function sha256Hex(s: string): Promise<string> {
 const DelegateTaskAsyncArgsSchema = DelegateTaskArgsSchema
 
 async function delegateTaskAsync(args: z.infer<typeof DelegateTaskAsyncArgsSchema>): Promise<unknown> {
-  const { workspaceId, token } = resolveWatching(args._as_workspace)
+  const { workspaceId, token, platformUrl } = resolveWatching(args._as_workspace)
   if (!args.workspace_id) throw new Error('workspace_id (target peer) is required')
   if (!args.task) throw new Error('task is required')
   // Idempotency key: SHA-256 of (target, task) so a restart firing the same
   // delegation gets the existing delegation_id back instead of creating a
   // duplicate (mirrors workspace/a2a_tools.py — fixes #1456 there).
   const idem = (await sha256Hex(`${args.workspace_id}:${args.task}`)).slice(0, 32)
-  const resp = await fetch(`${PLATFORM_URL}/workspaces/${workspaceId}/delegate`, {
+  const resp = await fetch(`${platformUrl}/workspaces/${workspaceId}/delegate`, {
     method: 'POST',
-    headers: platformHeaders(token, { 'Content-Type': 'application/json' }),
+    headers: platformHeaders(token, platformUrl, { 'Content-Type': 'application/json' }),
     body: JSON.stringify({
       target_id: args.workspace_id,
       task: args.task,
@@ -962,9 +1052,9 @@ const CheckTaskStatusArgsSchema = z.object({
 })
 
 async function checkTaskStatus(args: z.infer<typeof CheckTaskStatusArgsSchema>): Promise<unknown> {
-  const { workspaceId, token } = resolveWatching(args._as_workspace)
-  const resp = await fetch(`${PLATFORM_URL}/workspaces/${workspaceId}/delegations`, {
-    headers: platformHeaders(token),
+  const { workspaceId, token, platformUrl } = resolveWatching(args._as_workspace)
+  const resp = await fetch(`${platformUrl}/workspaces/${workspaceId}/delegations`, {
+    headers: platformHeaders(token, platformUrl),
     signal: AbortSignal.timeout(15_000),
   })
   if (!resp.ok) {
@@ -996,11 +1086,11 @@ const CommitMemoryArgsSchema = z.object({
 })
 
 async function commitMemory(args: z.infer<typeof CommitMemoryArgsSchema>): Promise<unknown> {
-  const { workspaceId, token } = resolveWatching(args._as_workspace)
+  const { workspaceId, token, platformUrl } = resolveWatching(args._as_workspace)
   if (!args.content) throw new Error('content is required')
-  const resp = await fetch(`${PLATFORM_URL}/workspaces/${workspaceId}/memories`, {
+  const resp = await fetch(`${platformUrl}/workspaces/${workspaceId}/memories`, {
     method: 'POST',
-    headers: platformHeaders(token, { 'Content-Type': 'application/json' }),
+    headers: platformHeaders(token, platformUrl, { 'Content-Type': 'application/json' }),
     body: JSON.stringify({
       content: args.content,
       scope: (args.scope ?? 'LOCAL').toUpperCase(),
@@ -1033,13 +1123,13 @@ const RecallMemoryArgsSchema = z.object({
 })
 
 async function recallMemory(args: z.infer<typeof RecallMemoryArgsSchema>): Promise<unknown> {
-  const { workspaceId, token } = resolveWatching(args._as_workspace)
-  const url = new URL(`${PLATFORM_URL}/workspaces/${workspaceId}/memories`)
+  const { workspaceId, token, platformUrl } = resolveWatching(args._as_workspace)
+  const url = new URL(`${platformUrl}/workspaces/${workspaceId}/memories`)
   url.searchParams.set('workspace_id', workspaceId)
   if (args.query) url.searchParams.set('q', args.query)
   if (args.scope) url.searchParams.set('scope', args.scope.toUpperCase())
   const resp = await fetch(url, {
-    headers: platformHeaders(token),
+    headers: platformHeaders(token, platformUrl),
     signal: AbortSignal.timeout(15_000),
   })
   if (!resp.ok) {
@@ -1295,7 +1385,8 @@ loadCursors()
   if (anyTooOld) {
     process.stderr.write(
       `molecule channel: refusing to start in poll mode against an older platform. ` +
-      `Pin MOLECULE_PLATFORM_URL to an upgraded tenant or downgrade to plugin v0.1.\n`
+      `Pin MOLECULE_PLATFORM_URL (or the failing entry in MOLECULE_PLATFORM_URLS) ` +
+      `to an upgraded tenant, or downgrade to plugin v0.1.\n`
     )
     // exit triggers the 'exit' listener, which unlinks the PID file.
     process.exit(2)
@@ -1314,12 +1405,28 @@ if (AUTO_REGISTER_POLL) {
   }
 }
 
-process.stderr.write(
-  `molecule channel: connected — watching ${WORKSPACE_IDS.length} workspace(s) at ${PLATFORM_URL}\n` +
-  `  workspaces: ${WORKSPACE_IDS.join(', ')}\n` +
-  `  delivery_mode=poll  cursor=${CURSOR_FILE}  auto_register=${AUTO_REGISTER_POLL}\n` +
-  `  poll: every ${POLL_INTERVAL_MS}ms (cursor-based; ${POLL_WINDOW_SECS}s window only used for first-run seed)\n`
-)
+// Distinct-URL count for the startup banner — when single-tenant
+// (1 unique URL across all watched workspaces) print the URL inline;
+// when multi-tenant (>1 unique URL) print "N tenants" + per-workspace
+// breakdown so the operator can see the routing without the line
+// growing unboundedly.
+const distinctPlatformUrls = new Set(WORKSPACE_IDS.map(urlFor))
+if (distinctPlatformUrls.size === 1) {
+  const onlyUrl = [...distinctPlatformUrls][0]
+  process.stderr.write(
+    `molecule channel: connected — watching ${WORKSPACE_IDS.length} workspace(s) at ${onlyUrl}\n` +
+    `  workspaces: ${WORKSPACE_IDS.join(', ')}\n` +
+    `  delivery_mode=poll  cursor=${CURSOR_FILE}  auto_register=${AUTO_REGISTER_POLL}\n` +
+    `  poll: every ${POLL_INTERVAL_MS}ms (cursor-based; ${POLL_WINDOW_SECS}s window only used for first-run seed)\n`
+  )
+} else {
+  process.stderr.write(
+    `molecule channel: connected — watching ${WORKSPACE_IDS.length} workspace(s) across ${distinctPlatformUrls.size} tenants\n` +
+    WORKSPACE_IDS.map(id => `    ${id} → ${urlFor(id)}\n`).join('') +
+    `  delivery_mode=poll  cursor=${CURSOR_FILE}  auto_register=${AUTO_REGISTER_POLL}\n` +
+    `  poll: every ${POLL_INTERVAL_MS}ms (cursor-based; ${POLL_WINDOW_SECS}s window only used for first-run seed)\n`
+  )
+}
 
 // Stagger initial polls slightly so N-workspace watchers don't all hit the
 // platform at the same instant on every tick.
