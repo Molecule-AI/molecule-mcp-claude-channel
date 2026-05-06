@@ -109,6 +109,27 @@ curl -X POST "$MOLECULE_PLATFORM_URL/admin/workspaces/$WORKSPACE_ID/tokens" \
   -d '{"label": "claude-channel"}'
 ```
 
+### Token rotation
+
+Rotate when:
+
+- you suspect compromise (token logged accidentally, `.env` shared, laptop lost)
+- a teammate with `.env` access leaves the org
+- the token has been in use long enough to want a fresh one (no hard expiry on platform-issued workspace tokens; rotate at your own cadence)
+
+How:
+
+1. Canvas → workspace → Settings → "Auth tokens" → **revoke** the old token
+2. Same surface → **Create channel token** → copy the new value
+3. Update `MOLECULE_WORKSPACE_TOKENS` in `~/.claude/channels/molecule/.env` (multi-workspace: same comma-separated order as `MOLECULE_WORKSPACE_IDS` — replace just the entry being rotated)
+4. Restart Claude Code (or `/reload-plugins`); the plugin re-reads `.env` on startup
+
+Revoke happens server-side immediately. The plugin's next poll against the revoked token returns 401, the polling loop logs the failure with the workspace id (and the platform URL — see v0.4.1), and the operator sees the rotation didn't fully complete.
+
+### `.env` is host-local
+
+Each host running this plugin (your laptop, a second workstation, a personal devbox) needs its own `~/.claude/channels/molecule/.env`. Tokens aren't synced — by design, since a stolen token shouldn't auto-grant access from another machine. Multi-workspace fan-out (`MOLECULE_WORKSPACE_IDS=a,b,c`) lives within ONE host's `.env`; running the same plugin on a second host with the same `.env` is supported but means both hosts will compete on the dedup state for those workspaces (the second host wins by writing the PID file later — there's a singleton lock per `.env` directory).
+
 ## How replies work
 
 When a peer's message lands in your session, both the rendered `content` and the structured `meta` block carry the routing data Claude needs:
