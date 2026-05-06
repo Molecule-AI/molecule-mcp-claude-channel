@@ -21,7 +21,17 @@ export interface ActivityEntry {
   created_at: string
 }
 
-export function extractText(act: ActivityEntry): string {
+export interface ExtractedText {
+  /** Concatenated text content, or the act.summary fallback. Never empty. */
+  text: string
+  /** Count of non-text parts (image, file, data) silently dropped on the
+   *  first matching shape. Used by the caller to log a stderr line so
+   *  the operator knows attachments aren't being delivered. Closes #7
+   *  (Optional — extractText silently drops non-text parts). */
+  droppedNonText: number
+}
+
+export function extractText(act: ActivityEntry): ExtractedText {
   // request_body is what the platform's a2a_proxy logs when forwarding A2A
   // to this workspace. Empirically (verified against workspace-server's
   // logA2ASuccess in a2a_proxy_helpers.go on 2026-04-29), the shape varies:
@@ -58,12 +68,15 @@ export function extractText(act: ActivityEntry): string {
   ]
   for (const parts of candidates) {
     if (Array.isArray(parts)) {
+      const isText = (p: { type?: string; kind?: string }) =>
+        p.kind === 'text' || p.type === 'text'
+      const droppedNonText = parts.filter(p => !isText(p)).length
       const text = parts
-        .filter(p => p.kind === 'text' || p.type === 'text')
+        .filter(isText)
         .map(p => p.text ?? '')
         .join('')
-      if (text) return text
+      if (text) return { text, droppedNonText }
     }
   }
-  return act.summary ?? '(empty A2A message)'
+  return { text: act.summary ?? '(empty A2A message)', droppedNonText: 0 }
 }

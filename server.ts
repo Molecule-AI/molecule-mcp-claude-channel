@@ -25,9 +25,15 @@
  * each id polls independently. Auth is per-workspace via
  * MOLECULE_WORKSPACE_TOKENS (same order, comma-separated).
  *
- * Cancellation: SIGTERM/SIGINT cleanly drains in-flight pollers + posts a
- * single "channel disconnecting" line back to each watched workspace so
- * peers see a deliberate close, not a silent timeout.
+ * Cancellation: SIGTERM/SIGINT stops scheduling new polls, drains the
+ * in-flight pollers within a deadline (8s, just under the slowest
+ * poll's 10s timeout), and exits cleanly. Peers see /a2a route through
+ * the platform's a2a_proxy as usual — when there's no longer a poll
+ * draining activity, push attempts surface the channel-closed state
+ * naturally. Pre-v0.4.1 the docstring promised an explicit "channel
+ * disconnecting" line back to each peer, but that requires platform-
+ * side peer-notification (not implemented); the realistic close above
+ * matches what the code does and what peers actually observe.
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -45,6 +51,7 @@ import { formatRemovedWorkspaceError } from './error-format.ts'
 import { agentCardUrlFor, enrichPeerMetadata, validatePeerId } from './peer-enrich.ts'
 import { formatChannelContent, sanitizeIdentityField } from './format-content.ts'
 import { resolvePlatformUrls } from './platform-urls.ts'
+import { delegateTaskMultiTenantHint } from './delegate-task-hints.ts'
 
 // ─── Config ─────────────────────────────────────────────────────────────
 
@@ -330,7 +337,7 @@ async function pollWorkspace(workspaceId: string, mcp: Server): Promise<void> {
       signal: AbortSignal.timeout(10_000),
     })
   } catch (err) {
-    process.stderr.write(`molecule channel: poll ${workspaceId} fetch failed: ${err}\n`)
+    process.stderr.write(`molecule channel: poll ${workspaceId} (${platformUrl}) fetch failed: ${err}\n`)
     return
   }
 
@@ -420,7 +427,7 @@ async function probeCursorSupport(workspaceId: string): Promise<'ok' | 'too_old'
       signal: AbortSignal.timeout(15_000),
     })
   } catch (err) {
-    process.stderr.write(`molecule channel: probe ${workspaceId} fetch failed: ${err}\n`)
+    process.stderr.write(`molecule channel: probe ${workspaceId} (${platformUrl}) fetch failed: ${err}\n`)
     return 'inconclusive'
   }
 
@@ -472,7 +479,7 @@ async function registerAsPoll(workspaceId: string): Promise<void> {
       signal: AbortSignal.timeout(15_000),
     })
   } catch (err) {
-    process.stderr.write(`molecule channel: register-as-poll ${workspaceId} fetch failed: ${err}\n`)
+    process.stderr.write(`molecule channel: register-as-poll ${workspaceId} (${platformUrl}) fetch failed: ${err}\n`)
     return
   }
   if (!resp.ok) {
@@ -502,7 +509,20 @@ async function registerAsPoll(workspaceId: string): Promise<void> {
 // ─── Notification emission ─────────────────────────────────────────────
 
 async function emitNotification(mcp: Server, workspaceId: string, act: ActivityEntry): Promise<void> {
-  const text = extractText(act)
+  const { text, droppedNonText } = extractText(act)
+  // Surface a stderr line when extractText silently dropped non-text
+  // parts (image, file, data). Without this the operator sees a peer
+  // message in the conversation turn but has no idea attachments
+  // shipped alongside the text were skipped — Claude responds "got
+  // your message" while the actual binary payload disappeared.
+  // v0.2-style attachments-by-reference is tracked separately; this
+  // is just the visibility gap so users know to chase it. Closes #7.
+  if (droppedNonText > 0) {
+    process.stderr.write(
+      `molecule channel: ${droppedNonText} non-text part(s) in activity ${act.id} ` +
+      `(workspace ${workspaceId}) skipped — image/file/data delivery is not yet supported\n`
+    )
+  }
   // Discriminate canvas-user messages (typed in the canvas chat panel) from
   // peer-agent A2A traffic. The canvas wraps user chat as JSON-RPC
   // message/send with source_id=null; real peers carry their workspace_id
@@ -992,9 +1012,33 @@ async function delegateTask(args: z.infer<typeof DelegateTaskArgsSchema>): Promi
   })
   if (!resp.ok) {
     const errText = await resp.text().catch(() => '')
-    throw new Error(`delegate_task failed: HTTP ${resp.status} — ${errText.slice(0, 200)}`)
+    // 404 on the peer endpoint is the canonical "peer not found at
+    // this tenant" signal. In multi-tenant mode the most likely
+    // failure mode is "named a peer that lives on a DIFFERENT tenant"
+    // — the platform's a2a_proxy is single-tenant. The hint string is
+    // factored into delegateTaskMultiTenantHint() so the exact wording
+    // is unit-tested.
+    const hint = (resp.status === 404 && hasMixedPlatformTenants())
+      ? delegateTaskMultiTenantHint(workspaceId, platformUrl)
+      : ''
+    throw new Error(`delegate_task failed: HTTP ${resp.status} — ${errText.slice(0, 200)}${hint}`)
   }
   return resp.json()
+}
+
+/**
+ * True iff the watched workspaces span more than one distinct platform
+ * URL — i.e. the user is in multi-tenant mode. Computed from
+ * URL_BY_WORKSPACE so it stays correct as the source of truth changes.
+ *
+ * Used by delegate_task's 404 error path to add a multi-tenant-aware
+ * hint. Cheap (O(N) Set construction over the watched-workspace count,
+ * which is bounded by however many workspaces the user explicitly
+ * declared in MOLECULE_WORKSPACE_IDS — never more than a handful in
+ * practice).
+ */
+function hasMixedPlatformTenants(): boolean {
+  return new Set(URL_BY_WORKSPACE.values()).size > 1
 }
 
 // Tool: delegate_task_async --------------------------------------------
@@ -1428,20 +1472,106 @@ if (distinctPlatformUrls.size === 1) {
   )
 }
 
-// Stagger initial polls slightly so N-workspace watchers don't all hit the
-// platform at the same instant on every tick.
+// In-flight poll tracker — used by the shutdown handler to await
+// outstanding work before exiting (closes #4). Without this, SIGTERM
+// would race against any HTTP request mid-flight, causing the next
+// process to start with a still-current /activity request returning
+// to a dead listener (manifests as a "fetch failed" log on the next
+// boot for the same activity_id we just queried).
+//
+// Set<Promise<void>> is the simplest tracker — pollWorkspace adds on
+// entry, removes on settle. shutdown awaits Promise.allSettled with
+// a deadline.
+const inFlightPolls = new Set<Promise<void>>()
+
+function trackedPoll(id: string): Promise<void> {
+  const p = pollWorkspace(id, mcp).catch(() => {
+    // pollWorkspace already logs to stderr; swallow here so the
+    // tracker doesn't hold onto rejected promises that the shutdown
+    // drain would then try to await again.
+  })
+  inFlightPolls.add(p)
+  void p.finally(() => { inFlightPolls.delete(p) })
+  return p
+}
+
+// Stagger initial polls slightly so N-workspace watchers don't all hit
+// the platform at the same instant on every tick. Add small random
+// jitter to setInterval too (closes #9): without it, every interval
+// fires N pollers at the same instant after the initial stagger
+// converges within ~5min of clock drift. With jitter the cadence
+// stays smooth across N workspaces.
+//
+// Jitter range: ±10% of POLL_INTERVAL_MS. Bigger ranges stretch the
+// effective tail latency without much herd benefit; smaller ranges
+// don't move the needle.
+const intervalIds: ReturnType<typeof setInterval>[] = []
 WORKSPACE_IDS.forEach((id, i) => {
   setTimeout(() => {
-    void pollWorkspace(id, mcp)
-    setInterval(() => void pollWorkspace(id, mcp), POLL_INTERVAL_MS).unref()
+    void trackedPoll(id)
+    const jitterMs = Math.floor((Math.random() - 0.5) * 0.2 * POLL_INTERVAL_MS)
+    const handle = setInterval(() => void trackedPoll(id), POLL_INTERVAL_MS + jitterMs)
+    handle.unref()
+    intervalIds.push(handle)
   }, i * 500)
 })
 
-// Clean shutdown — fire-and-forget a "disconnected" notice on each watched
-// workspace's A2A so peers don't sit waiting on a silent channel.
-const shutdown = (sig: string) => {
-  process.stderr.write(`molecule channel: ${sig} — shutting down\n`)
+// Clean shutdown — drain in-flight pollers within a deadline, then
+// exit. The pre-#4 implementation just `process.exit(0)`'d, which
+// raced against any HTTP fetch mid-flight (verified 2026-04-30 on
+// hongmingwang tenant: SIGTERM during a slow /activity poll surfaced
+// as a fetch-failed log on the NEXT process boot for the same
+// activity_id, because the AbortController's signal was dropped on
+// the floor mid-request).
+//
+// The pre-#4 file-header docstring also promised "posts a single
+// 'channel disconnecting' line back to each watched workspace so peers
+// see a deliberate close" — that's not implementable without a
+// platform-side peer-notification API. The realistic close is: stop
+// scheduling new polls, drain in-flight, log per-workspace shutdown
+// lines for the operator, exit. Peers see a /a2a route that returns
+// the next time they call (poll is gone, so a2a_proxy attempts push
+// against the now-stale URL and surfaces an error) — same as a
+// graceful shutdown of any polling integration.
+const SHUTDOWN_DRAIN_TIMEOUT_MS = 8_000  // < the slowest poll's 10s timeout, so drain bounded
+
+let shuttingDown = false
+async function shutdown(sig: string): Promise<void> {
+  if (shuttingDown) return  // SIGINT-then-SIGTERM should not double-drain
+  shuttingDown = true
+
+  process.stderr.write(`molecule channel: ${sig} — shutting down (draining ${inFlightPolls.size} in-flight poll(s))\n`)
+
+  // Stop scheduling new polls — clearInterval on every tracked handle.
+  // (setInterval was .unref()'d so the process can exit naturally
+  // once the event loop is empty, but we clear explicitly to be
+  // certain a follow-up tick doesn't add a new poll mid-drain.)
+  for (const h of intervalIds) clearInterval(h)
+
+  // Race the drain against the deadline. Promise.allSettled never
+  // rejects; the timeout guarantees we don't block on a wedged HTTP
+  // call.
+  const drainDeadline = new Promise<'timeout'>((resolve) => {
+    setTimeout(() => resolve('timeout'), SHUTDOWN_DRAIN_TIMEOUT_MS).unref()
+  })
+  const drain = Promise.allSettled([...inFlightPolls]).then(() => 'drained' as const)
+  const outcome = await Promise.race([drainDeadline, drain])
+
+  if (outcome === 'timeout') {
+    process.stderr.write(
+      `molecule channel: shutdown drain hit ${SHUTDOWN_DRAIN_TIMEOUT_MS}ms deadline ` +
+      `with ${inFlightPolls.size} poll(s) still in-flight; exiting anyway\n`
+    )
+  } else {
+    process.stderr.write(`molecule channel: drain complete — exiting cleanly\n`)
+  }
+
+  for (const id of WORKSPACE_IDS) {
+    process.stderr.write(`molecule channel: stopped watching ${id}\n`)
+  }
+
+  // exit() triggers the 'exit' listener which unlinks the PID file.
   process.exit(0)
 }
-process.on('SIGINT', () => shutdown('SIGINT'))
-process.on('SIGTERM', () => shutdown('SIGTERM'))
+process.on('SIGINT', () => void shutdown('SIGINT'))
+process.on('SIGTERM', () => void shutdown('SIGTERM'))
