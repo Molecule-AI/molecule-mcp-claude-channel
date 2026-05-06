@@ -50,8 +50,9 @@ import { extractText, type ActivityEntry } from './extract-text.ts'
 import { formatRemovedWorkspaceError } from './error-format.ts'
 import { agentCardUrlFor, enrichPeerMetadata, validatePeerId } from './peer-enrich.ts'
 import { formatChannelContent, sanitizeIdentityField } from './format-content.ts'
-import { resolvePlatformUrls } from './platform-urls.ts'
+import { resolvePlatformUrls, hasMixedTenants } from './platform-urls.ts'
 import { delegateTaskMultiTenantHint } from './delegate-task-hints.ts'
+import { computeJitteredInterval } from './jitter.ts'
 
 // ─── Config ─────────────────────────────────────────────────────────────
 
@@ -1509,8 +1510,11 @@ const intervalIds: ReturnType<typeof setInterval>[] = []
 WORKSPACE_IDS.forEach((id, i) => {
   setTimeout(() => {
     void trackedPoll(id)
-    const jitterMs = Math.floor((Math.random() - 0.5) * 0.2 * POLL_INTERVAL_MS)
-    const handle = setInterval(() => void trackedPoll(id), POLL_INTERVAL_MS + jitterMs)
+    // computeJitteredInterval lives in ./jitter.ts so the bounds
+    // contract (±10% by default) is unit-testable. Pre-v0.4.2 the
+    // math was inlined here and only verifiable by code review;
+    // see #30 weak spot 2 for the full reasoning.
+    const handle = setInterval(() => void trackedPoll(id), computeJitteredInterval(POLL_INTERVAL_MS))
     handle.unref()
     intervalIds.push(handle)
   }, i * 500)
