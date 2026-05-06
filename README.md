@@ -30,10 +30,16 @@ On first MCP-server launch the plugin creates `~/.claude/channels/molecule/` and
 ```
 # ~/.claude/channels/molecule/.env
 
-# Required
+# Required (single-tenant — every watched workspace lives on the same Molecule tenant)
 MOLECULE_PLATFORM_URL=https://your-tenant.staging.moleculesai.app
 MOLECULE_WORKSPACE_IDS=ws-uuid-1,ws-uuid-2
 MOLECULE_WORKSPACE_TOKENS=tok-1,tok-2
+
+# Required (multi-tenant — watched workspaces span multiple Molecule tenants)
+# Replace MOLECULE_PLATFORM_URL with a comma-separated list, same order as IDS:
+# MOLECULE_PLATFORM_URLS=https://personal.moleculesai.app,https://team.moleculesai.app
+# MOLECULE_WORKSPACE_IDS=ws-personal,ws-team
+# MOLECULE_WORKSPACE_TOKENS=tok-personal,tok-team
 
 # Optional
 MOLECULE_POLL_INTERVAL_MS=5000     # default 5s
@@ -46,6 +52,20 @@ MOLECULE_AUTO_REGISTER_POLL=true   # set to "false" if you've configured the wor
 The `.env` file is `chmod 600` after first read; tokens never appear in environment-block-style `claude doctor` dumps.
 
 The config dir name (`molecule`) is intentionally NOT renamed in v0.4 even though the plugin is now `molecule-channel` — the rename would silently lose every existing user's `.env` on upgrade. The dir name is only visible if you're editing the `.env` manually.
+
+### Multi-tenant: watch workspaces across multiple Molecule tenants
+
+If your watched workspaces live on different Molecule tenants (a personal subdomain + a team subdomain, say), use `MOLECULE_PLATFORM_URLS` (plural) instead of `MOLECULE_PLATFORM_URL` (singular). One URL per workspace, same order as `MOLECULE_WORKSPACE_IDS`:
+
+```
+MOLECULE_PLATFORM_URLS=https://personal.moleculesai.app,https://team.moleculesai.app
+MOLECULE_WORKSPACE_IDS=ws-uuid-personal,ws-uuid-team
+MOLECULE_WORKSPACE_TOKENS=tok-personal,tok-team
+```
+
+The plural shape and the singular shape are mutually exclusive — when both are set, the plural wins. The plural's parity check is strict: `MOLECULE_PLATFORM_URLS` MUST have the same number of entries as `MOLECULE_WORKSPACE_IDS`, otherwise the plugin refuses to start (a missing entry would otherwise silently route through the wrong tenant). The singular shape is preserved for back-compat with single-tenant users — no `.env` changes needed on upgrade.
+
+Cross-tenant `delegate_task` is NOT supported: a watched workspace can only delegate to peers on its own tenant. The `peer_id` in `reply_to_workspace` must also be a peer of the watching workspace's tenant. Closes [#3013 issue 4](https://github.com/Molecule-AI/molecule-core/issues/3013).
 
 Restart Claude Code or run `/reload-plugins`. You should see on stderr:
 
