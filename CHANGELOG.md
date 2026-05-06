@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.4.2 — testability + SSOT cleanup (closes #30, the 3 weak spots from PR #28)
+
+No behavior change for end users. Internal quality-of-implementation
+improvements: every promise made by v0.4.1 now has a discriminating
+unit test behind it, and the duplicate predicate is gone.
+
+### Changed (no user-visible behavior)
+
+- **Jitter math extracted to `./jitter.ts` as `computeJitteredInterval`.** The inline `Math.floor((Math.random() - 0.5) * 0.2 * POLL_INTERVAL_MS)` in v0.4.1 was untestable because `Math.random` isn't seedable; `computeJitteredInterval(intervalMs, opts?)` accepts an injected `random` source and an explicit `factor`. 8 new tests pin the bounds contract (default ±10% half-range, midpoint = no jitter, scales linearly with intervalMs, factor=0 opt-out).
+- **Duplicate `hasMixedPlatformTenants()` removed** in favour of `hasMixedTenants()` from `./platform-urls.ts`. v0.4.1 unintentionally shipped two implementations of `new Set(urls).size > 1`; consolidating to the platform-urls.ts SSOT (already test-covered there) means a future predicate change lands in one place. Computed once at startup as `MIXED_PLATFORM_TENANTS` since `URL_BY_WORKSPACE` is immutable post-init.
+- **Shutdown-drain test now pins the in-flight count, not just the log shape.** v0.4.1's test ran against `https://t.example/` so polls fast-failed before SIGTERM and N=0 was the typical outcome — drain-with-N-pollers was untested. v0.4.2 adds a second test case that spins up a local `Bun.serve` fixture holding poll responses; the test waits until exactly N pollers are observed at the fixture, SIGTERMs, and asserts `draining 2 in-flight poll(s)` literally + the deadline-hit path (drain returns gracefully even when polls are wedged). The original fast-fail test stays as the cheap regression guard for the no-work case.
+
+### Test counts
+
+- 80 → 89 tests across 8 → 9 files (8 new jitter tests + 1 net new shutdown-drain test case for the deterministic in-flight scenario).
+
 ## v0.4.1 — channel hygiene (closes #4 + #7 + #9 + 2 parked items from #3013)
 
 No breaking changes; drop-in upgrade from v0.4.0.

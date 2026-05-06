@@ -5,14 +5,14 @@
   },
   "metadata": {
     "description": "Claude Code channel plugin for Molecule AI — bridges Molecule A2A traffic into a Claude Code session via MCP. Subscribe to one or more Molecule workspaces; A2A messages from peers surface as conversation turns; replies route back through Molecule's A2A endpoints.",
-    "version": "0.4.1"
+    "version": "0.4.2"
   },
   "plugins": [
     {
       "name": "molecule-channel",
       "source": "./",
       "description": "Molecule AI channel — surfaces A2A messages from your watched workspaces as conversation turns and routes replies back via reply_to_workspace.",
-      "version": "0.4.1",
+      "version": "0.4.2",
       "homepage": "https://github.com/Molecule-AI/molecule-mcp-claude-channel",
       "repository": "https://github.com/Molecule-AI/molecule-mcp-claude-channel",
       "license": "Apache-2.0",
