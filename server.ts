@@ -163,6 +163,14 @@ const TOKEN_BY_WORKSPACE = new Map<string, string>(
 const URL_BY_WORKSPACE = new Map<string, string>(
   WORKSPACE_IDS.map((id, i) => [id, PLATFORM_URLS[i]])
 )
+// MIXED_PLATFORM_TENANTS is computed once at startup — URL_BY_WORKSPACE
+// is immutable after this point. Pre-v0.4.2 this lived as a private
+// `function hasMixedPlatformTenants()` in this file that duplicated
+// `hasMixedTenants()` from ./platform-urls.ts (caught in #30 weak spot
+// 3). Consolidating to the platform-urls.ts SSOT means a future change
+// to the predicate (e.g. ignore trailing-slash differences) lands in
+// one tested place.
+const MIXED_PLATFORM_TENANTS = hasMixedTenants([...URL_BY_WORKSPACE.values()])
 
 /**
  * urlFor — the single SSOT for "which platform URL does this watched
@@ -1019,27 +1027,12 @@ async function delegateTask(args: z.infer<typeof DelegateTaskArgsSchema>): Promi
     // — the platform's a2a_proxy is single-tenant. The hint string is
     // factored into delegateTaskMultiTenantHint() so the exact wording
     // is unit-tested.
-    const hint = (resp.status === 404 && hasMixedPlatformTenants())
+    const hint = (resp.status === 404 && MIXED_PLATFORM_TENANTS)
       ? delegateTaskMultiTenantHint(workspaceId, platformUrl)
       : ''
     throw new Error(`delegate_task failed: HTTP ${resp.status} — ${errText.slice(0, 200)}${hint}`)
   }
   return resp.json()
-}
-
-/**
- * True iff the watched workspaces span more than one distinct platform
- * URL — i.e. the user is in multi-tenant mode. Computed from
- * URL_BY_WORKSPACE so it stays correct as the source of truth changes.
- *
- * Used by delegate_task's 404 error path to add a multi-tenant-aware
- * hint. Cheap (O(N) Set construction over the watched-workspace count,
- * which is bounded by however many workspaces the user explicitly
- * declared in MOLECULE_WORKSPACE_IDS — never more than a handful in
- * practice).
- */
-function hasMixedPlatformTenants(): boolean {
-  return new Set(URL_BY_WORKSPACE.values()).size > 1
 }
 
 // Tool: delegate_task_async --------------------------------------------
