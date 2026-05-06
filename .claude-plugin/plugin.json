@@ -1,7 +1,7 @@
 {
   "name": "molecule-channel",
   "description": "Molecule AI channel for Claude Code — bridges Molecule A2A traffic into a Claude Code session via MCP. Subscribe to one or more Molecule workspaces; A2A messages from peers surface as conversation turns; replies route back through Molecule's A2A endpoints.",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "keywords": [
     "molecule",
     "molecule-ai",

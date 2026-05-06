@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.4.1 — channel hygiene (closes #4 + #7 + #9 + 2 parked items from #3013)
+
+No breaking changes; drop-in upgrade from v0.4.0.
+
+### Fixed
+
+- **#4 Shutdown drain.** SIGTERM/SIGINT now stops scheduling new polls, awaits in-flight pollers within an 8s deadline, then exits cleanly. Pre-fix `process.exit(0)` raced against any HTTP fetch mid-flight (verified on hongmingwang tenant 2026-04-30: SIGTERM during a slow `/activity` poll surfaced as a fetch-failed log on the NEXT process boot for the same `activity_id`). Also aligned the file-header docstring to match reality (the pre-fix docstring promised peer-facing notifications that aren't implementable without a platform-side peer-notification API).
+- **#7 extractText non-text part visibility.** When a peer's A2A carries non-text parts (image, file, data) alongside text, the plugin now logs `N non-text part(s) in activity X (workspace Y) skipped` to stderr. Pre-fix the parts were filtered silently, so the operator saw the text in the conversation turn but had no idea attachments shipped alongside it were dropped. (Attachment delivery itself is still tracked separately as a v0.5 feature.)
+- **#9 Poll-loop thundering herd.** `setInterval` now adds ±10% jitter to `POLL_INTERVAL_MS` so N pollers don't all fire at the same instant after the initial 500ms-stagger converges within ~5min of clock drift. Cadence stays smooth across N watched workspaces.
+
+### Improved
+
+- **Probe / poll / register-as-poll error logs include the platform URL.** Pre-v0.4.1 `poll ws-X fetch failed: ...` named the workspace_id but not the URL, so a multi-tenant misconfiguration (typo in one entry of `MOLECULE_PLATFORM_URLS`) required cross-referencing the startup banner. Now each error log line shows `(${platformUrl})` inline. Closes a parked item from #3013.
+- **`delegate_task` 404 hint in multi-tenant mode.** When `delegate_task` returns 404 AND the install is multi-tenant (more than one distinct platform URL across watched workspaces), the error message now appends a hint that cross-tenant delegation is not supported by the platform's `a2a_proxy`, names the watching tenant the request was routed to, and points at `list_peers` for the right peer set. Closes a parked item from #3013.
+
 ## v0.4.0 — installable + namespaced (closes Molecule-AI/molecule-core#3013)
 
 **Breaking change.** The MCP server name + plugin name change. If you had any pre-0.4 install, see "Migrating from pre-0.4" in the README.
