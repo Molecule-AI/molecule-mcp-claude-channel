@@ -16,11 +16,16 @@ No tunnel. No public endpoint. The plugin self-registers each watched workspace 
 
 ## Install
 
-```bash
-claude --channels plugin:molecule@Molecule-AI/molecule-mcp-claude-channel
+Install via the [Claude Code plugin marketplace](https://code.claude.com/docs/en/plugin-marketplaces) flow:
+
+```
+/plugin marketplace add Molecule-AI/molecule-mcp-claude-channel
+/plugin install molecule-channel@molecule-mcp-claude-channel
 ```
 
-On first launch the plugin creates `~/.claude/channels/molecule/` and exits with a config-missing error pointing at `.env`. Fill it in:
+`/reload-plugins` to activate the plugin in the current session (or restart Claude Code).
+
+On first MCP-server launch the plugin creates `~/.claude/channels/molecule/` and exits with a config-missing error pointing at `.env`. Fill it in:
 
 ```
 # ~/.claude/channels/molecule/.env
@@ -40,19 +45,30 @@ MOLECULE_AUTO_REGISTER_POLL=true   # set to "false" if you've configured the wor
 
 The `.env` file is `chmod 600` after first read; tokens never appear in environment-block-style `claude doctor` dumps.
 
-Re-launch Claude Code:
+The config dir name (`molecule`) is intentionally NOT renamed in v0.4 even though the plugin is now `molecule-channel` — the rename would silently lose every existing user's `.env` on upgrade. The dir name is only visible if you're editing the `.env` manually.
 
-```bash
-claude --channels plugin:molecule@Molecule-AI/molecule-mcp-claude-channel
-```
-
-You should see on stderr:
+Restart Claude Code or run `/reload-plugins`. You should see on stderr:
 
 ```
 molecule channel: connected — watching 2 workspace(s) at https://your-tenant.staging.moleculesai.app
   workspaces: ws-uuid-1, ws-uuid-2
   poll: every 5000ms with 30s window
 ```
+
+Confirm the MCP server is registered: run `/mcp` and look for `molecule-channel`. If you previously had a Molecule MCP server named `molecule` in `~/.claude/settings.json`, it stays — `molecule-channel` does not collide with it (this rename closes [#3013](https://github.com/Molecule-AI/molecule-core/issues/3013)).
+
+### Migrating from pre-0.4
+
+Pre-0.4 docs suggested an undocumented `claude --channels plugin:NAME@OWNER/REPO` syntax that silently no-op'd on Claude Code 2.1.x ([#3013](https://github.com/Molecule-AI/molecule-core/issues/3013)). v0.4 ships the standard marketplace install path above.
+
+If you had the pre-0.4 plugin somehow installed under the name `molecule`, uninstall it before installing `molecule-channel`:
+
+```
+/plugin uninstall molecule@molecule-mcp-claude-channel
+/plugin install   molecule-channel@molecule-mcp-claude-channel
+```
+
+Your `.env` at `~/.claude/channels/molecule/.env` is preserved.
 
 ## Getting workspace_id + token
 
