@@ -48,6 +48,7 @@ MOLECULE_POLL_WINDOW_SECS=30       # default 30s — only used to seed the first
 MOLECULE_AGENT_NAME="Claude Code (channel)"           # how the workspace appears in canvas
 MOLECULE_AGENT_DESC="Local Claude Code session..."
 MOLECULE_AUTO_REGISTER_POLL=true   # set to "false" if you've configured the workspace another way
+MOLECULE_HEARTBEAT_INTERVAL_MS=30000  # default 30s — keeps the canvas presence badge on "online"; set to 0 to disable
 ```
 
 The `.env` file is `chmod 600` after first read; tokens never appear in environment-block-style `claude doctor` dumps.

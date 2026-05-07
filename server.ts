@@ -41,6 +41,7 @@ import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync, renameSy
 import { homedir } from 'os'
 import { join } from 'path'
 import { extractText, type ActivityEntry } from './extract-text.ts'
+import { sendHeartbeat } from './heartbeat.ts'
 
 // ─── Config ─────────────────────────────────────────────────────────────
 
@@ -87,6 +88,23 @@ const AGENT_DESC = process.env.MOLECULE_AGENT_DESC ??
 // the plugin overwriting agent_card on every restart.
 const AUTO_REGISTER_POLL = !['0', 'false', 'no'].includes(
   (process.env.MOLECULE_AUTO_REGISTER_POLL ?? 'true').toLowerCase()
+)
+// MOLECULE_HEARTBEAT_INTERVAL_MS — cadence for the per-workspace
+// /registry/heartbeat ping that keeps the canvas presence badge on
+// "online" (closes #6 / molecule-core#24).
+//
+// Default 30_000ms (30s) matches the Python runtime's HEARTBEAT_INTERVAL
+// in workspace/heartbeat.py and is well under the platform's 90s
+// `REMOTE_LIVENESS_STALE_AFTER` window — three heartbeat ticks fit
+// inside the staleness budget so a single dropped POST doesn't flap
+// the workspace to `awaiting_agent`.
+//
+// Set to 0 to disable the heartbeat loop entirely (useful for tests
+// or for operators who run a separate heartbeat daemon). Negative
+// values are clamped to 0.
+const HEARTBEAT_INTERVAL_MS = Math.max(
+  0,
+  parseInt(process.env.MOLECULE_HEARTBEAT_INTERVAL_MS ?? '30000', 10) || 0,
 )
 
 if (!PLATFORM_URL || WORKSPACE_IDS.length === 0 || WORKSPACE_TOKENS.length === 0) {
@@ -1261,7 +1279,11 @@ process.stderr.write(
   `molecule channel: connected — watching ${WORKSPACE_IDS.length} workspace(s) at ${PLATFORM_URL}\n` +
   `  workspaces: ${WORKSPACE_IDS.join(', ')}\n` +
   `  delivery_mode=poll  cursor=${CURSOR_FILE}  auto_register=${AUTO_REGISTER_POLL}\n` +
-  `  poll: every ${POLL_INTERVAL_MS}ms (cursor-based; ${POLL_WINDOW_SECS}s window only used for first-run seed)\n`
+  `  poll: every ${POLL_INTERVAL_MS}ms (cursor-based; ${POLL_WINDOW_SECS}s window only used for first-run seed)\n` +
+  `  heartbeat: ` +
+    (HEARTBEAT_INTERVAL_MS > 0
+      ? `every ${HEARTBEAT_INTERVAL_MS}ms (POST /registry/heartbeat — keeps canvas presence on 'online')\n`
+      : `disabled (MOLECULE_HEARTBEAT_INTERVAL_MS=0; canvas will flip to 'awaiting_agent' after 90s)\n`)
 )
 
 // Stagger initial polls slightly so N-workspace watchers don't all hit the
@@ -1272,6 +1294,38 @@ WORKSPACE_IDS.forEach((id, i) => {
     setInterval(() => void pollWorkspace(id, mcp), POLL_INTERVAL_MS).unref()
   }, i * 500)
 })
+
+// Per-workspace heartbeat ticker — closes #6 / molecule-core#24.
+//
+// The startup `registerAsPoll` upsert already bumped `last_heartbeat_at`
+// on each row, so the workspace is "online" from boot. The first heartbeat
+// fires after one full HEARTBEAT_INTERVAL_MS so we don't double-pump on
+// startup; subsequent ticks keep the row fresh inside the 90s stale
+// window enforced by workspace-server's healthsweep.
+//
+// Stagger by i * 500ms so N-workspace plugins don't fan-spike the
+// platform — same shape as the poll-loop staggering above.
+//
+// Conditional on HEARTBEAT_INTERVAL_MS > 0 so tests / unusual deploys
+// can disable the loop without hacking around the ticker. .unref() so
+// the heartbeat doesn't keep the event loop alive at shutdown.
+//
+// `sendHeartbeat` is imported from ./heartbeat.ts — see that file for
+// the full presence-bug rationale + wire-shape contract.
+if (HEARTBEAT_INTERVAL_MS > 0) {
+  WORKSPACE_IDS.forEach((id, i) => {
+    setTimeout(() => {
+      setInterval(
+        () => void sendHeartbeat({
+          platformUrl: PLATFORM_URL,
+          workspaceId: id,
+          token: TOKEN_BY_WORKSPACE.get(id)!,
+        }),
+        HEARTBEAT_INTERVAL_MS,
+      ).unref()
+    }, i * 500)
+  })
+}
 
 // Clean shutdown — fire-and-forget a "disconnected" notice on each watched
 // workspace's A2A so peers don't sit waiting on a silent channel.
