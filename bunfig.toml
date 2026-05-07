@@ -1,0 +1,6 @@
+# bunfig.toml — preload the test env-mock setup so server.ts's
+# required-config guard doesn't call process.exit(1) when test files
+# import pure helpers from it. See tests/setup.ts for the full
+# rationale.
+[test]
+preload = ["./tests/setup.ts"]
