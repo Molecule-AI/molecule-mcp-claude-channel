@@ -28,9 +28,43 @@ claude plugin install molecule@molecule-channel
 
 `molecule` is the plugin name (from `.claude-plugin/plugin.json`); `molecule-channel` is the marketplace name (from `.claude-plugin/marketplace.json`). Both live in the same repo — installing the marketplace makes the plugin available; installing the plugin enables it for your sessions.
 
-To pin a specific version, append `#<tag>` to the marketplace URL — for example `…/molecule-mcp-claude-channel.git#v0.4.0-gitea.1`. Without a ref, you track `main`.
+To pin a specific version, append `#<tag>` to the marketplace URL — for example `…/molecule-mcp-claude-channel.git#v0.4.0-gitea.3`. Without a ref, you track `main`.
 
 > **Note for users coming from the GitHub install path**: the GitHub `Molecule-AI` org was suspended on 2026-05-06 and is permanently gone. The earlier `claude --channels plugin:molecule@Molecule-AI/...` invocation no longer resolves. The new path (above) is the canonical replacement; behavior is unchanged.
+>
+> **Don't use the `claude --channels plugin:…` one-liner.** It silently no-ops on Claude Code 2.1.129 (and likely 2.1.x in general). The marketplace flow above is the only path that actually registers the plugin. If a previous setup guide pointed you at `claude --channels plugin:molecule@…`, ignore it.
+
+### Allowing the channel via `allowedChannelPlugins`
+
+The Claude Code host gates channel-plugin notifications behind an explicit allow-list. The plugin won't deliver `notifications/claude/channel` events to your session unless this list contains an entry that matches.
+
+**Schema.** `allowedChannelPlugins` is an array of **objects**, not strings. The shape is `{ "plugin": "<plugin-name>", "marketplace": "<marketplace-name>" }`. The host's Zod validator silently ignores entries that aren't objects in this shape — so a bare-string entry like `"molecule"` or `"molecule@molecule-channel"` will load without error and contribute nothing to the allow-list. The symptom: poll loop runs cleanly, cursor advances, stderr says "delivered", and the message never reaches the conversation.
+
+For this plugin, the entry is:
+
+```json
+{ "plugin": "molecule", "marketplace": "molecule-channel" }
+```
+
+**Location.** `allowedChannelPlugins` only takes effect from the **managed-settings** file:
+
+- macOS: `/Library/Application Support/ClaudeCode/managed-settings.json`
+- Linux: `/etc/claude-code/managed-settings.json`
+- Windows: `C:\ProgramData\ClaudeCode\managed-settings.json`
+
+Putting it in your user-level `~/.claude/settings.json` (or `~/.claude/settings.local.json`) does **not** work — the host reads the field only from the managed location. Most self-hosters try the user-level file first; this is the single most common reason a freshly-installed channel plugin appears to do nothing. The managed-settings file may need `sudo` to edit on macOS/Linux.
+
+A minimal working `managed-settings.json`:
+
+```json
+{
+  "allowedChannelPlugins": [
+    { "plugin": "molecule", "marketplace": "molecule-channel" }
+  ]
+}
+```
+
+After editing, restart Claude Code (or `/reload-plugins`) for the host to re-read the file.
 
 On first launch the plugin creates `~/.claude/channels/molecule/` and exits with a config-missing error pointing at `.env`. Fill it in:
 

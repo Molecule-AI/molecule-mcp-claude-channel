@@ -1,6 +1,6 @@
 {
   "name": "molecule-mcp-claude-channel",
-  "version": "0.4.0-gitea.2",
+  "version": "0.4.0-gitea.3",
   "description": "Molecule AI channel for Claude Code — bridges A2A traffic into a Claude Code session via MCP",
   "license": "Apache-2.0",
   "type": "module",

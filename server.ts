@@ -244,6 +244,29 @@ function saveCursors(): void {
   }
 }
 
+// Per-row inbound filter for the activity feed. The `?type=a2a_receive`
+// query already restricts the kind, but the platform STILL returns the
+// agent's own outbound /notify rows in that view — they're recorded as
+// a2a_receive on the SAME workspace_id with method='notify' and a null
+// source_id. emitNotification would then classify them as `canvas_user`
+// inbound (because peer_id is empty), and every reply this plugin sent
+// would echo back as a fake user turn one poll later — the model would
+// see its own answer as a new user prompt and try to "respond" to it,
+// burning tokens and confusing the conversation.
+//
+// Filter on the row level so the cursor still advances past these rows
+// (the caller already advances cursor to activities[last].id regardless
+// of skip/emit, so a long run of notify-only rows can't stall the cursor).
+//
+// Reno-Stars caught this as the v0.4.0-gitea.2 → .3 P1 fix. Exported so
+// a regression test can pin the contract without standing up a fake
+// activity-feed HTTP fixture just to assert one boolean.
+export function shouldEmitActivity(act: Pick<ActivityEntry, 'method'>): boolean {
+  // Outbound /notify calls (this agent's own replies) — silently drop.
+  if (act.method === 'notify') return false
+  return true
+}
+
 async function pollWorkspace(workspaceId: string, mcp: Server): Promise<void> {
   const token = TOKEN_BY_WORKSPACE.get(workspaceId)!
   const url = new URL(`${PLATFORM_URL}/workspaces/${workspaceId}/activity`)
@@ -328,6 +351,7 @@ async function pollWorkspace(workspaceId: string, mcp: Server): Promise<void> {
   // notification delivery is best-effort anyway.
   if (activities.length === 0) return
   for (const act of activities) {
+    if (!shouldEmitActivity(act)) continue
     emitNotification(mcp, workspaceId, act)
   }
   const newest = activities[activities.length - 1].id
@@ -488,9 +512,30 @@ function emitNotification(mcp: Server, workspaceId: string, act: ActivityEntry):
 
 // ─── MCP server ─────────────────────────────────────────────────────────
 
+// Capabilities: declaring `experimental['claude/channel']` is what makes the
+// Claude Code MCP host actually deliver our `notifications/claude/channel`
+// events into the conversation. Without it the host treats this server as
+// tool-only and silently drops every channel notification — the poll
+// advances, the cursor moves, stderr says "delivered", and yet no message
+// reaches the user. The companion `claude/channel/permission` flag opts the
+// server into the permission-prompt path the host gates channel writes on.
+//
+// Reno-Stars caught this as the v0.4.0-gitea.2 → .3 P0 fix; mirrors the
+// shape used by the official telegram channel plugin's MCP server.
+//
+// Exported so a regression test can pin the shape without spinning up a
+// real Server / stdio transport.
+export const SERVER_CAPABILITIES = {
+  tools: {},
+  experimental: {
+    'claude/channel': {},
+    'claude/channel/permission': {},
+  },
+} as const
+
 const mcp = new Server(
-  { name: 'molecule', version: '0.3.0' },
-  { capabilities: { tools: {} } },
+  { name: 'molecule', version: '0.4.0-gitea.3' },
+  { capabilities: SERVER_CAPABILITIES },
 )
 
 // Tool: reply_to_workspace ----------------------------------------------
